@@ -261,7 +261,7 @@ void remove_artifact_batch(
 }
 
 // ============================================================
-// 頂層模組: 即時處理模式 (滑動視窗)
+// 頂層模組: 即時處理模式 (方案 B: 50% 重疊 + 只輸出中央區域)
 // ============================================================
 
 void remove_artifact_realtime(
@@ -279,34 +279,53 @@ void remove_artifact_realtime(
     #pragma HLS INTERFACE s_axilite port=flush    bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return   bundle=ctrl
 
-    // ===== 靜態緩衝 (雙緩衝) =====
-    static data_t window_buf[2][WINDOW_SIZE];
-    static data_t output_buf[2][WINDOW_SIZE];
+    // ===== 方案 B: 50% 重疊 + 只輸出中央區域 =====
+    //
+    // 核心概念：
+    // - 使用 50% 重疊的滑動視窗
+    // - 每個視窗處理 WINDOW_SIZE (1848) 樣本
+    // - 只輸出中央 HOP_SIZE (924) 樣本，邊界區域丟棄
+    // - 邊界效應被消除，因為邊界區域會被下一個視窗的中央區域覆蓋
+    //
+    // 特殊處理：
+    // - 第一個視窗：輸出前半部分 (0 ~ HOP_SIZE)
+    // - 中間視窗：輸出中央區域 (HOP_SIZE/2 ~ HOP_SIZE/2 + HOP_SIZE)
+    // - 最後 flush：輸出剩餘未輸出的樣本
+
+    // ===== 靜態緩衝 =====
+    // 雙緩衝：前半段保留上一個視窗的後半部分
+    static data_t window_buf[WINDOW_SIZE];
+    static data_t output_buf[WINDOW_SIZE];  // 暫存處理結果
+    static data_t cos_vals[K][WINDOW_SIZE];
+    static data_t sin_vals[K][WINDOW_SIZE];
 
     #pragma HLS BIND_STORAGE variable=window_buf type=ram_2p
     #pragma HLS BIND_STORAGE variable=output_buf type=ram_2p
+    #pragma HLS BIND_STORAGE variable=cos_vals type=ram_2p
+    #pragma HLS BIND_STORAGE variable=sin_vals type=ram_2p
 
     // 狀態變數
-    static ap_uint<1> buf_sel = 0;
-    static int sample_idx = 0;
-    static ap_uint<64> global_idx = 0;
-    static bool first_window = true;
-    static int pending_output_samples = 0;  // 待輸出的樣本數 (用於 flush)
+    static int buf_idx = 0;              // 緩衝區寫入位置
+    static ap_uint<64> global_idx = 0;   // 全域樣本索引 (用於相位計算)
+    static int total_input = 0;          // 總輸入樣本數
+    static int total_output = 0;         // 總輸出樣本數
+    static int window_count = 0;         // 處理的視窗數
+    static bool has_prev_window = false; // 是否有上一個視窗資料
 
-    // 混合權重 (漢寧窗)
-    static data_t blend_weights[WINDOW_SIZE];
-    static bool weights_initialized = false;
+    // 係數平滑用的靜態變數
+    static coef_t prev_alpha[M_SIZE];    // 上一個視窗的 alpha 係數
+    static bool has_prev_alpha = false;  // 是否有上一個 alpha
 
-    // 初始化混合權重
-    if (!weights_initialized) {
-        INIT_WEIGHTS:
-        for (int i = 0; i < WINDOW_SIZE; i++) {
-            #pragma HLS PIPELINE II=1
-            float w = 0.5f - 0.5f * hls::cosf(TWO_PI * i / WINDOW_SIZE);
-            blend_weights[i] = data_t(w);
-        }
-        weights_initialized = true;
-    }
+    // EMA 平滑係數 (0.3 = 30% 新值 + 70% 舊值)
+    const float ALPHA_SMOOTH = 0.3f;
+
+    // 處理參數
+    const float omega = TWO_PI * dbs_freq;
+    const float dt = 1.0f / FS;
+
+    // 輸出區域定義
+    const int CENTER_START = HOP_SIZE / 2;  // 中央區域起始 = 462
+    const int CENTER_END = CENTER_START + HOP_SIZE;  // 中央區域結束 = 1386
 
     // Bypass 模式
     if (!enable) {
@@ -317,121 +336,278 @@ void remove_artifact_realtime(
         return;
     }
 
-    // ===== Flush 模式：輸出剩餘緩衝資料 =====
+    // ===== Flush 模式：輸出剩餘資料 =====
     if (flush) {
-        // 如果有未處理完的樣本，用零填充到完整視窗
-        if (sample_idx > 0) {
-            // 填充剩餘位置為零
-            FLUSH_PAD_ZEROS:
-            for (int i = sample_idx; i < HOP_SIZE; i++) {
-                #pragma HLS PIPELINE II=1
-                window_buf[buf_sel][HOP_SIZE + i] = data_t(0);
-            }
+        int remaining = total_input - total_output;
 
-            // 處理最後一個不完整的視窗
-            process_window_internal(
-                window_buf[buf_sel],
-                output_buf[buf_sel],
-                dbs_freq,
-                global_idx - sample_idx
-            );
+        if (remaining > 0) {
+            // 如果緩衝區有足夠資料，做最後一次處理
+            if (buf_idx >= HOP_SIZE) {
+                int N = buf_idx;
 
-            // 輸出混合結果
-            if (!first_window) {
-                FLUSH_BLEND:
-                for (int i = 0; i < HOP_SIZE; i++) {
+                // 產生 sin/cos
+                FLUSH_SINCOS:
+                for (int n = 0; n < N; n++) {
                     #pragma HLS PIPELINE II=1
-                    data_t prev_contrib = output_buf[1 - buf_sel][HOP_SIZE + i] *
-                                          blend_weights[HOP_SIZE + i];
-                    data_t curr_contrib = output_buf[buf_sel][i] *
-                                          blend_weights[i];
-                    data_t mixed = prev_contrib + curr_contrib;
-                    axis_pkt_t out_pkt = data_to_axis(mixed, false);
+                    float t = (float)(global_idx - buf_idx + n) * dt;
+                    for (int k = 0; k < K; k++) {
+                        #pragma HLS UNROLL
+                        float phase = omega * (k + 1) * t;
+                        phase = phase - TWO_PI * hls::floorf(phase / TWO_PI);
+                        cos_vals[k][n] = data_t(hls::cosf(phase));
+                        sin_vals[k][n] = data_t(hls::sinf(phase));
+                    }
+                }
+
+                // 初始化矩陣
+                accum_t M[M_SIZE][M_SIZE];
+                accum_t b[M_SIZE];
+                coef_t alpha[M_SIZE];
+
+                #pragma HLS ARRAY_PARTITION variable=M dim=1 complete
+                #pragma HLS ARRAY_PARTITION variable=alpha complete
+
+                for (int i = 0; i < M_SIZE; i++) {
+                    #pragma HLS UNROLL
+                    b[i] = 0;
+                    for (int j = 0; j < M_SIZE; j++) {
+                        #pragma HLS UNROLL
+                        M[i][j] = 0;
+                    }
+                }
+
+                // 累加 Gram 矩陣
+                FLUSH_GRAM:
+                for (int n = 0; n < N; n++) {
+                    #pragma HLS PIPELINE II=1
+                    data_t s_n = window_buf[n];
+
+                    M[0][0] += 1;
+                    b[0] += accum_t(s_n);
+
+                    for (int k = 0; k < K; k++) {
+                        #pragma HLS UNROLL
+                        data_t c_k = cos_vals[k][n];
+                        data_t s_k = sin_vals[k][n];
+
+                        M[0][k + 1] += accum_t(c_k);
+                        M[0][K + 1 + k] += accum_t(s_k);
+                        b[k + 1] += accum_t(s_n) * accum_t(c_k);
+                        b[K + 1 + k] += accum_t(s_n) * accum_t(s_k);
+
+                        for (int j = 0; j < K; j++) {
+                            #pragma HLS UNROLL
+                            M[k + 1][j + 1] += accum_t(c_k) * accum_t(cos_vals[j][n]);
+                            M[K + 1 + k][K + 1 + j] += accum_t(s_k) * accum_t(sin_vals[j][n]);
+                            M[k + 1][K + 1 + j] += accum_t(c_k) * accum_t(sin_vals[j][n]);
+                        }
+                    }
+                }
+
+                // 填充對稱
+                for (int i = 1; i < M_SIZE; i++) {
+                    M[i][0] = M[0][i];
+                    for (int j = i + 1; j < M_SIZE; j++) {
+                        M[j][i] = M[i][j];
+                    }
+                }
+
+                // 求解
+                cholesky_solve(M, b, alpha);
+
+                // 輸出剩餘樣本 (從上一個視窗的結束位置開始)
+                remaining = total_input - total_output;
+                FLUSH_OUTPUT:
+                for (int n = 0; n < remaining && n < N; n++) {
+                    #pragma HLS PIPELINE II=1
+                    accum_t artifact = 0;
+                    for (int k = 0; k < K; k++) {
+                        #pragma HLS UNROLL
+                        artifact += accum_t(alpha[k + 1]) * accum_t(cos_vals[k][n]);
+                        artifact += accum_t(alpha[K + 1 + k]) * accum_t(sin_vals[k][n]);
+                    }
+                    data_t clean = window_buf[n] - data_t(artifact);
+                    axis_pkt_t out_pkt = data_to_axis(clean, (n == remaining - 1));
                     m_axis.write(out_pkt);
                 }
+                total_output += remaining;
+            } else if (buf_idx > 0) {
+                // 資料太少，直接輸出原始訊號
+                FLUSH_DIRECT:
+                for (int n = 0; n < remaining && n < buf_idx; n++) {
+                    #pragma HLS PIPELINE II=1
+                    axis_pkt_t out_pkt = data_to_axis(window_buf[n], (n == remaining - 1));
+                    m_axis.write(out_pkt);
+                }
+                total_output += remaining;
             }
-
-            // 切換緩衝
-            buf_sel = 1 - buf_sel;
         }
 
-        // 輸出最後一個視窗的後半部分 (不需要混合)
-        FLUSH_FINAL:
-        for (int i = 0; i < HOP_SIZE; i++) {
-            #pragma HLS PIPELINE II=1
-            // 直接輸出當前緩衝的後半部分
-            data_t val = output_buf[1 - buf_sel][HOP_SIZE + i];
-            axis_pkt_t out_pkt = data_to_axis(val, (i == HOP_SIZE - 1));
-            m_axis.write(out_pkt);
-        }
-
-        // 重置所有狀態 (準備下一次使用)
-        buf_sel = 0;
-        sample_idx = 0;
+        // 重置狀態
+        buf_idx = 0;
         global_idx = 0;
-        first_window = true;
-        pending_output_samples = 0;
+        total_input = 0;
+        total_output = 0;
+        window_count = 0;
+        has_prev_window = false;
+        has_prev_alpha = false;
+        for (int i = 0; i < M_SIZE; i++) {
+            prev_alpha[i] = 0;
+        }
 
         return;
     }
 
     // ===== 正常處理模式 =====
-    // 讀取一個 hop 的資料
-    READ_HOP:
+
+    // 讀取樣本
+    READ_SAMPLES:
     for (int i = 0; i < HOP_SIZE; i++) {
         #pragma HLS PIPELINE II=1
 
         if (!s_axis.empty()) {
             axis_pkt_t pkt = s_axis.read();
-            // 寫入當前視窗的後半部分
-            window_buf[buf_sel][HOP_SIZE + sample_idx] = axis_to_data(pkt);
-            sample_idx++;
+            window_buf[buf_idx] = axis_to_data(pkt);
+            buf_idx++;
             global_idx++;
-            pending_output_samples++;
+            total_input++;
         }
     }
 
     // 當收集滿一個視窗時處理
-    if (sample_idx >= HOP_SIZE) {
-        sample_idx = 0;
-
-        // 處理當前視窗
-        process_window_internal(
-            window_buf[buf_sel],
-            output_buf[buf_sel],
-            dbs_freq,
-            global_idx - WINDOW_SIZE
-        );
-
-        // 輸出混合結果
-        if (!first_window) {
-            OUTPUT_BLEND:
-            for (int i = 0; i < HOP_SIZE; i++) {
-                #pragma HLS PIPELINE II=1
-
-                // Overlap-add 混合
-                data_t prev_contrib = output_buf[1 - buf_sel][HOP_SIZE + i] *
-                                      blend_weights[HOP_SIZE + i];
-                data_t curr_contrib = output_buf[buf_sel][i] *
-                                      blend_weights[i];
-                data_t mixed = prev_contrib + curr_contrib;
-
-                axis_pkt_t out_pkt = data_to_axis(mixed, false);
-                m_axis.write(out_pkt);
-                pending_output_samples--;
+    if (buf_idx >= WINDOW_SIZE) {
+        // 產生 sin/cos
+        GEN_SINCOS:
+        for (int n = 0; n < WINDOW_SIZE; n++) {
+            #pragma HLS PIPELINE II=1
+            float t = (float)(global_idx - WINDOW_SIZE + n) * dt;
+            for (int k = 0; k < K; k++) {
+                #pragma HLS UNROLL
+                float phase = omega * (k + 1) * t;
+                phase = phase - TWO_PI * hls::floorf(phase / TWO_PI);
+                cos_vals[k][n] = data_t(hls::cosf(phase));
+                sin_vals[k][n] = data_t(hls::sinf(phase));
             }
         }
-        first_window = false;
 
-        // 滑動視窗: 將後半移到前半
-        SLIDE_WINDOW:
-        for (int i = 0; i < HOP_SIZE; i++) {
-            #pragma HLS PIPELINE II=1
-            window_buf[1 - buf_sel][i] = window_buf[buf_sel][HOP_SIZE + i];
+        // 初始化矩陣
+        accum_t M[M_SIZE][M_SIZE];
+        accum_t b[M_SIZE];
+        coef_t alpha[M_SIZE];
+
+        #pragma HLS ARRAY_PARTITION variable=M dim=1 complete
+        #pragma HLS ARRAY_PARTITION variable=alpha complete
+
+        for (int i = 0; i < M_SIZE; i++) {
+            #pragma HLS UNROLL
+            b[i] = 0;
+            for (int j = 0; j < M_SIZE; j++) {
+                #pragma HLS UNROLL
+                M[i][j] = 0;
+            }
         }
 
-        // 切換緩衝
-        buf_sel = 1 - buf_sel;
+        // 累加 Gram 矩陣
+        GRAM_ACCUMULATE:
+        for (int n = 0; n < WINDOW_SIZE; n++) {
+            #pragma HLS PIPELINE II=1
+            data_t s_n = window_buf[n];
+
+            M[0][0] += 1;
+            b[0] += accum_t(s_n);
+
+            for (int k = 0; k < K; k++) {
+                #pragma HLS UNROLL
+                data_t c_k = cos_vals[k][n];
+                data_t s_k = sin_vals[k][n];
+
+                M[0][k + 1] += accum_t(c_k);
+                M[0][K + 1 + k] += accum_t(s_k);
+                b[k + 1] += accum_t(s_n) * accum_t(c_k);
+                b[K + 1 + k] += accum_t(s_n) * accum_t(s_k);
+
+                for (int j = 0; j < K; j++) {
+                    #pragma HLS UNROLL
+                    M[k + 1][j + 1] += accum_t(c_k) * accum_t(cos_vals[j][n]);
+                    M[K + 1 + k][K + 1 + j] += accum_t(s_k) * accum_t(sin_vals[j][n]);
+                    M[k + 1][K + 1 + j] += accum_t(c_k) * accum_t(sin_vals[j][n]);
+                }
+            }
+        }
+
+        // 填充對稱
+        for (int i = 1; i < M_SIZE; i++) {
+            M[i][0] = M[0][i];
+            for (int j = i + 1; j < M_SIZE; j++) {
+                M[j][i] = M[i][j];
+            }
+        }
+
+        // 求解
+        cholesky_solve(M, b, alpha);
+
+        // ===== EMA 係數平滑 =====
+        // alpha_smoothed = ALPHA_SMOOTH * alpha_new + (1 - ALPHA_SMOOTH) * alpha_prev
+        if (has_prev_alpha) {
+            SMOOTH_ALPHA:
+            for (int i = 0; i < M_SIZE; i++) {
+                #pragma HLS UNROLL
+                alpha[i] = coef_t(ALPHA_SMOOTH * (float)alpha[i] +
+                                  (1.0f - ALPHA_SMOOTH) * (float)prev_alpha[i]);
+            }
+        }
+
+        // 保存當前 alpha 供下次使用
+        SAVE_ALPHA:
+        for (int i = 0; i < M_SIZE; i++) {
+            #pragma HLS UNROLL
+            prev_alpha[i] = alpha[i];
+        }
+        has_prev_alpha = true;
+
+        // 處理並暫存結果
+        PROCESS_WINDOW:
+        for (int n = 0; n < WINDOW_SIZE; n++) {
+            #pragma HLS PIPELINE II=1
+            accum_t artifact = 0;
+            for (int k = 0; k < K; k++) {
+                #pragma HLS UNROLL
+                artifact += accum_t(alpha[k + 1]) * accum_t(cos_vals[k][n]);
+                artifact += accum_t(alpha[K + 1 + k]) * accum_t(sin_vals[k][n]);
+            }
+            output_buf[n] = window_buf[n] - data_t(artifact);
+        }
+
+        // 決定輸出範圍
+        int out_start, out_end;
+        if (window_count == 0) {
+            // 第一個視窗：輸出前 3/4 (0 ~ CENTER_END)
+            out_start = 0;
+            out_end = CENTER_END;
+        } else {
+            // 後續視窗：只輸出中央區域 (CENTER_START ~ CENTER_END)
+            out_start = CENTER_START;
+            out_end = CENTER_END;
+        }
+
+        // 輸出
+        OUTPUT_CENTER:
+        for (int n = out_start; n < out_end; n++) {
+            #pragma HLS PIPELINE II=1
+            axis_pkt_t out_pkt = data_to_axis(output_buf[n], false);
+            m_axis.write(out_pkt);
+        }
+        total_output += (out_end - out_start);
+        window_count++;
+
+        // 滑動視窗：保留後半部分到前半部分
+        SLIDE_WINDOW:
+        for (int n = 0; n < HOP_SIZE; n++) {
+            #pragma HLS PIPELINE II=1
+            window_buf[n] = window_buf[n + HOP_SIZE];
+        }
+        buf_idx = HOP_SIZE;
+        has_prev_window = true;
     }
 }
 

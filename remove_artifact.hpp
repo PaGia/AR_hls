@@ -37,11 +37,11 @@ const int M_SIZE = 2 * K + 1;      // 矩陣維度 (21)
 // 視窗參數 (用於即時處理)
 // 視窗大小 = DBS 週期數 × 每週期樣本數
 // 130 Hz @ 30kHz → 約 231 samples/period
-// 8 個週期 → 1848 samples
-const int DBS_PERIODS = 8;
+// 16 個週期 → 3696 samples (增大以提升頻率解析度)
+const int DBS_PERIODS = 16;
 const int SAMPLES_PER_PERIOD = 231;  // FS / DBS_FREQ ≈ 231
-const int WINDOW_SIZE = DBS_PERIODS * SAMPLES_PER_PERIOD;  // 1848
-const int HOP_SIZE = WINDOW_SIZE / 2;  // 50% 重疊
+const int WINDOW_SIZE = DBS_PERIODS * SAMPLES_PER_PERIOD;  // 3696
+const int HOP_SIZE = WINDOW_SIZE / 2;  // 50% 重疊 = 1848
 
 // 最大緩衝大小 (批次處理模式)
 const int N_MAX = 65536;  // 增加到 64K 以支援 2 秒資料 (60000 samples)
