@@ -1,8 +1,21 @@
 # DBS 偽影移除 HLS IP
 
-## 概述
+[![Platform](https://img.shields.io/badge/Platform-KV260-blue)](https://www.xilinx.com/products/som/kria/kv260-vision-starter-kit.html)
+[![HLS](https://img.shields.io/badge/Tool-Vitis%20HLS-orange)](https://www.xilinx.com/products/design-tools/vitis/vitis-hls.html)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-本專案實現基於 **諧波分解** 的 DBS (Deep Brain Stimulation) 偽影移除演算法，目標平台為 **KV260 (Zynq UltraScale+)**。
+## 專案概述
+
+本專案實現基於 **諧波分解** 的 DBS (Deep Brain Stimulation) 偽影移除演算法，用於從神經訊號中即時移除刺激偽影。採用 Vitis HLS 開發，目標平台為 **AMD KV260 (Zynq UltraScale+)**。
+
+### 主要特性
+
+- **雙模式支援**: 批次處理模式（PYNQ 測試）+ 即時串流模式（實際應用）
+- **統一介面設計**: 透過單一頂層函數 `remove_artifact_top` 控制所有功能
+- **AXI 介面**: AXI-Stream（資料流）+ AXI-Lite（控制暫存器）
+- **Q16.16 定點數**: 32-bit 二補數格式，16-bit 整數 + 16-bit 小數
+- **高效能**: 批次模式 ~1000× 即時，串流模式固定延遲 ~62 ms
+- **無頻譜洩漏**: 視窗長度對齊 DBS 週期，全域相位追蹤，overlap-add 混合
 
 ---
 
@@ -183,9 +196,11 @@ M = │ m₂₁ m₂₂  │ = │ l₂₁ l₂₂  │ × │ l₂₁ l₂₂  
 | `FS` | 30000 | 採樣率 (Hz) |
 | `K` | 10 | 諧波數量 |
 | `M_SIZE` | 21 | 矩陣維度 (2K+1) |
-| `WINDOW_SIZE` | 1848 | 視窗大小 (8 個 DBS 週期) |
-| `HOP_SIZE` | 924 | 跳躍大小 (50% 重疊) |
-| `N_MAX` | 32768 | 最大批次樣本數 |
+| `DBS_PERIODS` | 16 | 視窗包含的 DBS 週期數 |
+| `WINDOW_SIZE` | 3696 | 視窗大小 (16 個週期 × 231 samples) |
+| `HOP_SIZE` | 1848 | 跳躍大小 (50% 重疊) |
+| `N_MAX` | 65536 | 最大批次樣本數 (64K) |
+| `TB_MAX_SAMPLES` | 1200001 | Testbench 支援最大樣本數 (40秒) |
 
 ---
 
@@ -193,10 +208,23 @@ M = │ m₂₁ m₂₂  │ = │ l₂₁ l₂₂  │ × │ l₂₁ l₂₂  
 
 | 型態 | 定義 | 用途 |
 |------|------|------|
-| `data_t` | `ap_fixed<24, 12>` | 訊號資料 |
-| `accum_t` | `ap_fixed<48, 24>` | 累加器 (避免溢位) |
-| `coef_t` | `ap_fixed<32, 16>` | 係數 |
+| `data_t` | `ap_fixed<32, 16>` | 訊號資料 (Q16.16 格式) |
+| `accum_t` | `ap_fixed<64, 32>` | 累加器 (避免溢位) |
+| `coef_t` | `ap_fixed<32, 16>` | 諧波係數 |
 | `phase_t` | `ap_fixed<32, 4>` | 相位 (高精度小數) |
+| `axis_pkt_t` | `ap_axis<32, 0, 0, 0>` | AXI-Stream 封包 |
+
+### Q16.16 定點數格式
+
+```
+32-bit 二補數表示法
+┌─────────────────┬─────────────────┐
+│   整數部分 (16) │   小數部分 (16) │
+│   bit[31:16]    │   bit[15:0]     │
+└─────────────────┴─────────────────┘
+範圍: -32768.0 ~ +32767.99998
+解析度: 1/65536 ≈ 0.000015
+```
 
 ---
 
@@ -208,19 +236,42 @@ M = │ m₂₁ m₂₂  │ = │ l₂₁ l₂₂  │ × │ l₂₁ l₂₂  
 ┌─────────────┐
 │  axis_pkt_t │
 ├─────────────┤
-│ data[31:0]  │  ← 24-bit 定點數 (符號擴展)
+│ data[31:0]  │  ← Q16.16 定點數 (32-bit 完整格式)
 │ keep[3:0]   │  ← 0xF (全部有效)
+│ strb[3:0]   │  ← 0xF (全部有效)
 │ last        │  ← 最後一筆資料為 1
 └─────────────┘
 ```
 
-### AXI-Lite (控制參數)
+### AXI-Lite (控制暫存器)
+
+#### 控制暫存器 (`ctrl_reg`)
+
+| Bit | 名稱 | 說明 |
+|-----|------|------|
+| 0 | `enable` | 啟用處理 (0=bypass, 1=處理) |
+| 1 | `mode` | 處理模式 (0=批次, 1=串流) |
+| 2 | `flush` | Flush 緩衝 (串流模式用) |
+| 3 | `start` | 開始處理 (批次模式用) |
+| 4 | `reset_state` | 重置內部狀態 |
+| 31:5 | - | 保留 |
+
+#### 狀態暫存器 (`status_reg`)
+
+| Bit | 名稱 | 說明 |
+|-----|------|------|
+| 0 | `ready` | IP 就緒 |
+| 1 | `busy` | 正在處理 |
+| 2 | `done` | 處理完成 (批次模式) |
+| 3 | `overflow` | 緩衝溢位 |
+| 31:4 | - | 保留 |
+
+#### 參數暫存器
 
 | 暫存器 | 型態 | 說明 |
 |--------|------|------|
-| `dbs_freq` | float | DBS 頻率 (Hz) |
-| `num_samples` | int | 批次樣本數 |
-| `enable` | 1-bit | 即時模式開關 |
+| `dbs_freq` | float | DBS 刺激頻率 (Hz) |
+| `num_samples` | uint32 | 批次處理的樣本數 |
 
 ---
 
@@ -261,77 +312,277 @@ float phase = 2π × freq × k × t;
 
 ```
 source_file/
-├── remove_artifact.hpp      # 標頭檔 (型態、常數、函數宣告)
-├── remove_artifact.cpp      # HLS 可合成程式碼
-├── remove_artifact_tb.cpp   # C 測試平台
-├── remove_artifact_simplified.m  # MATLAB 參考實現
-├── test_simplified_version.m     # MATLAB 測試腳本
-└── README.md                # 本文件
+├── remove_artifact.hpp              # 標頭檔 (型態、常數、函數宣告)
+├── remove_artifact.cpp              # HLS 可合成程式碼 (871 行)
+│   ├── remove_artifact_top()        # 統一介面 (支援批次/串流模式)
+│   ├── remove_artifact_batch()      # 批次處理模式 (舊介面)
+│   ├── remove_artifact_realtime()   # 串流處理模式 (舊介面)
+│   └── 內部函數 (Gram 矩陣、Cholesky 求解等)
+│
+├── remove_artifact_tb.cpp           # C 測試平台 (775 行)
+│   ├── 支援外部 CSV 資料載入 (Q16.16 格式)
+│   ├── 可切換批次/串流模式測試
+│   ├── 可切換統一介面/舊介面測試
+│   └── 三方比較: HLS vs MATLAB vs Ground Truth
+│
+├── tset_file/                       # 測試資料目錄
+│   ├── post_add_lab_40s.csv         # 輸入訊號 (含偽影, 40秒, Q16.16)
+│   ├── AR_reference_40s.csv         # MATLAB 參考輸出 (Q16.16)
+│   ├── post_lfp_data_40s.csv        # 標準答案 (無偽影, Q16.16)
+│   ├── post_add_lab_2s.csv          # 輸入訊號 (2秒)
+│   ├── AR_reference_2s.csv          # MATLAB 參考輸出 (2秒)
+│   └── post_lfp_data_2s.csv         # 標準答案 (2秒)
+│
+├── remove_artifact_simplified.m     # MATLAB 參考實現
+├── test_simplified_version.m        # MATLAB 測試腳本
+└── README.md                        # 本文件
 ```
+
+### 核心函數說明
+
+#### `remove_artifact_top()` - 統一介面（推薦使用）
+
+```cpp
+void remove_artifact_top(
+    hls::stream<axis_pkt_t>& s_axis,     // 輸入 AXI-Stream
+    hls::stream<axis_pkt_t>& m_axis,     // 輸出 AXI-Stream
+    float dbs_freq,                      // DBS 頻率 (Hz)
+    ap_uint<32> num_samples,             // 批次樣本數
+    ap_uint<32> ctrl_reg,                // 控制暫存器
+    ap_uint<32>& status_reg              // 狀態暫存器
+);
+```
+
+**特點：**
+
+- 單一函數支援批次和串流兩種模式
+- 透過 `ctrl_reg` 位元控制所有功能
+- 所有參數可透過 AXI-Lite 動態設定
+- 支援狀態查詢和錯誤偵測
+
+---
+
+## 測試與驗證
+
+### Testbench 配置選項
+
+在 [remove_artifact_tb.cpp](remove_artifact_tb.cpp) 中可透過宏定義切換測試模式：
+
+```cpp
+#define USE_EXTERNAL_DATA true        // true: 載入 CSV, false: 模擬訊號
+#define USE_REALTIME_MODE true        // true: 串流模式, false: 批次模式
+#define USE_UNIFIED_INTERFACE true    // true: 統一介面, false: 舊介面
+```
+
+### 測試指標
+
+測試平台會自動計算並比較：
+
+1. **HLS vs Ground Truth**（標準答案，無偽影訊號）
+   - 相關係數 (要求 > 0.8)
+   - 相對誤差 RMS
+
+2. **HLS vs MATLAB**（MATLAB 處理結果）
+   - 相關係數 (要求 > 0.9)
+   - 相對誤差 RMS
+
+3. **諧波抑制量**
+   - 各諧波頻率的功率抑制 (dB)
+   - 平均抑制量 (要求 > 20 dB)
+
+### 輸出檔案
+
+- `hls_test_results.csv`: 完整比較資料（浮點數格式，供 MATLAB 分析）
+- `hls_output_q16.csv`: HLS 輸出（Q16.16 格式，與硬體一致）
 
 ---
 
 ## 使用方式
 
-### Vitis HLS
+### Vitis HLS 合成
 
 ```tcl
 # 建立專案
 open_project remove_artifact_prj
-set_top remove_artifact_batch
+set_top remove_artifact_top           # 使用統一介面
 add_files remove_artifact.cpp
 add_files remove_artifact.hpp
 add_files -tb remove_artifact_tb.cpp
+add_files -tb tset_file/*.csv         # 測試資料
 
 # 設定目標
 open_solution "solution1"
-set_part {xck26-sfvc784-2LV-c}
-create_clock -period 10 -name default
+set_part {xck26-sfvc784-2LV-c}        # KV260
+create_clock -period 10 -name default # 100 MHz
 
 # 執行
-csim_design      # C 模擬
-csynth_design    # 合成
-export_design -format ip_catalog
+csim_design                           # C 模擬 (需時 40 秒資料處理)
+csynth_design                         # 合成
+cosim_design                          # Co-simulation (可選)
+export_design -format ip_catalog     # 匯出 IP
 ```
 
-### PYNQ
+### PYNQ 部署
+
+#### 批次處理模式範例
 
 ```python
+import numpy as np
 from pynq import Overlay, allocate
 
+# 載入 bitstream
 ol = Overlay('remove_artifact.bit')
-dma = ol.axi_dma
-ip = ol.remove_artifact_hls_0
+dma = ol.axi_dma_0
+ip = ol.remove_artifact_top_0
 
-# 設定參數
-ip.write(ip.register_map.dbs_freq.address, float_to_int(130.0))
-ip.write(ip.register_map.num_samples.address, 30000)
+# 準備輸入資料 (Q16.16 格式)
+N = 30000  # 1 秒資料
+input_data = load_signal()  # 載入訊號
+input_q16 = (input_data * 65536).astype(np.int32)
+
+# 配置 DMA 緩衝區
+input_buf = allocate(shape=(N,), dtype=np.int32)
+output_buf = allocate(shape=(N,), dtype=np.int32)
+input_buf[:] = input_q16
+
+# 設定參數 (AXI-Lite)
+ip.write(0x10, int(129.871 * 1000))  # dbs_freq (定點數表示)
+ip.write(0x14, N)                     # num_samples
+
+# 設定控制暫存器: enable=1, mode=0 (批次), start=1
+ip.write(0x00, 0x09)  # ctrl_reg = 0b1001
 
 # DMA 傳輸
-input_buf = allocate(shape=(30000,), dtype=np.int32)
-output_buf = allocate(shape=(30000,), dtype=np.int32)
-
 dma.sendchannel.transfer(input_buf)
 dma.recvchannel.transfer(output_buf)
 dma.sendchannel.wait()
 dma.recvchannel.wait()
+
+# 讀取結果 (Q16.16 轉浮點數)
+output_data = output_buf.astype(np.float32) / 65536.0
+```
+
+#### 串流處理模式範例
+
+```python
+# 設定控制暫存器: enable=1, mode=1 (串流)
+ip.write(0x00, 0x03)  # ctrl_reg = 0b0011
+
+# 持續處理串流資料
+while streaming:
+    # 讀取新資料
+    new_samples = read_adc(HOP_SIZE)
+    input_buf[:] = (new_samples * 65536).astype(np.int32)
+
+    # DMA 傳輸
+    dma.sendchannel.transfer(input_buf)
+    dma.recvchannel.transfer(output_buf)
+    dma.recvchannel.wait()
+
+    # 處理輸出
+    cleaned = output_buf.astype(np.float32) / 65536.0
+    process_output(cleaned)
+
+# 結束時 flush 緩衝
+ip.write(0x00, 0x07)  # ctrl_reg = 0b0111 (enable + mode + flush)
 ```
 
 ---
 
 ## 效能預估
 
-| 指標 | 批次模式 | 即時模式 |
+| 指標 | 批次模式 | 串流模式 |
 |------|----------|----------|
 | 處理速度 | ~1000× 即時 | 1× 即時 |
 | 延遲 | N cycles | ~62 ms (固定) |
 | BRAM 使用 | ~2 MB | ~50 KB |
 | DSP 使用 | ~60 | ~60 |
+| 時脈頻率 | 100 MHz | 100 MHz |
+
+---
+
+## 近期更新
+
+### 2024-12-01
+
+**Commit: `6e2f5d5` - fix: real-time border smoothing**
+
+- 修復即時模式邊界平滑問題
+- 改善 overlap-add 視窗混合
+- 提升串流輸出連續性
+
+**Commit: `a08bc19` - Init: 2mode remove artifact**
+
+- 實現雙模式架構（批次 + 串流）
+- 新增統一介面 `remove_artifact_top()`
+- 增加視窗大小至 16 個 DBS 週期（提升頻率解析度）
+- 支援 40 秒長時間資料測試
+
+### 主要改進
+
+1. **視窗大小優化**
+   - 從 8 個週期增加到 16 個週期
+   - `WINDOW_SIZE`: 1848 → 3696 samples
+   - 提升諧波分離精度
+
+2. **Q16.16 定點數格式**
+   - 更新為完整 32-bit 格式
+   - 整數部分: 16-bit（範圍 ±32768）
+   - 小數部分: 16-bit（解析度 ~0.000015）
+
+3. **測試資料擴充**
+   - 新增 40 秒測試資料（1,200,000 samples）
+   - 包含 Ground Truth 比對
+   - 支援三方驗證（HLS vs MATLAB vs Ground Truth）
+
+---
+
+## 已知限制
+
+- 批次模式最大處理樣本數: 65536 (受 `N_MAX` 限制)
+- 串流模式固定延遲: ~62 ms (不可調整)
+- DBS 頻率範圍: 建議 100-200 Hz
+- 諧波數量固定為 10 (編譯時常數)
 
 ---
 
 ## 參考資料
 
-- 原始 MATLAB 實現: `remove_artifact_simplified.m`
-- 數學原理: 最小二乘法諧波分解
-- 目標平台: AMD KV260 Vision AI Starter Kit
+- **原始 MATLAB 實現**: `remove_artifact_simplified.m`
+- **數學原理**: 最小二乘法諧波分解 (Least Squares Harmonic Decomposition)
+- **目標平台**: AMD KV260 Vision AI Starter Kit
+- **開發工具**: Vitis HLS 2023.2+
+
+---
+
+## Git 狀態
+
+```bash
+# 當前分支
+main
+
+# 已修改檔案
+M remove_artifact.hpp
+M remove_artifact_tb.cpp
+
+# 新增測試資料
+?? tset_file/AR_reference_40s.csv
+?? tset_file/post_add_lab_40s.csv
+?? tset_file/post_lfp_data_40s.csv
+```
+
+---
+
+## 授權
+
+MIT License
+
+---
+
+## 作者
+
+Generated from MATLAB implementation `remove_artifact_simplified.m`
+
+## 聯絡方式
+
+如有問題或建議，請透過 GitHub Issues 回報。

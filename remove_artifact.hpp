@@ -44,7 +44,7 @@ const int WINDOW_SIZE = DBS_PERIODS * SAMPLES_PER_PERIOD;  // 3696
 const int HOP_SIZE = WINDOW_SIZE / 2;  // 50% 重疊 = 1848
 
 // 最大緩衝大小 (批次處理模式)
-const int N_MAX = 65536;  // 增加到 64K 以支援 2 秒資料 (60000 samples)
+const int N_MAX = 65536;  // 64K (批次模式用，realtime 模式不需要這麼大)
 
 // 數學常數
 const float PI = 3.14159265358979f;

@@ -36,13 +36,16 @@
 // 設定為 true 使用串流處理模式，false 使用批次處理模式
 #define USE_REALTIME_MODE true
 
+// Testbench 專用緩衝大小 (可大於 N_MAX，因為 realtime 模式用串流處理不需要大陣列)
+const int TB_MAX_SAMPLES = 1200001;  // 支援 40 秒資料 (1200000 samples)
+
 // 設定為 true 使用新的統一介面 (remove_artifact_top)，false 使用舊介面
 #define USE_UNIFIED_INTERFACE true
 
 // 外部資料檔案路徑 (當 USE_EXTERNAL_DATA = true 時使用)
-const char* INPUT_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_add_lab_2s.csv";
-const char* GOLDEN_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/AR_reference_2s.csv";  // MATLAB 參考輸出
-const char* GROUND_TRUTH_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_lfp_data_2s.csv";  // 標準答案 (無偽影)
+const char* INPUT_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_add_lab_40s.csv";
+const char* GOLDEN_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/AR_reference_40s.csv";  // MATLAB 參考輸出
+const char* GROUND_TRUTH_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_lfp_data_40s.csv";  // 標準答案 (無偽影)
 
 // ============================================================
 // 控制暫存器位元定義 (與 remove_artifact.cpp 同步)
@@ -297,12 +300,12 @@ int main() {
     srand(42);
 
     // ===== 配置記憶體 =====
-    float* neural_signal = new float[N_MAX];
-    float* artifact_true = new float[N_MAX];
-    float* mixed_signal = new float[N_MAX];
-    float* clean_signal = new float[N_MAX];
-    float* golden_signal = new float[N_MAX];  // MATLAB 參考輸出 (AR_reference)
-    float* ground_truth = new float[N_MAX];   // 標準答案 (post_lfp_data, 無偽影)
+    float* neural_signal = new float[TB_MAX_SAMPLES];
+    float* artifact_true = new float[TB_MAX_SAMPLES];
+    float* mixed_signal = new float[TB_MAX_SAMPLES];
+    float* clean_signal = new float[TB_MAX_SAMPLES];
+    float* golden_signal = new float[TB_MAX_SAMPLES];  // MATLAB 參考輸出 (AR_reference)
+    float* ground_truth = new float[TB_MAX_SAMPLES];   // 標準答案 (post_lfp_data, 無偽影)
     float true_phases[K];
     int num_samples = TEST_NUM_SAMPLES;
     bool has_ground_truth = false;  // 有標準答案 (無偽影訊號)
@@ -313,21 +316,21 @@ int main() {
     std::cout << "\n--- 載入外部資料 ---" << std::endl;
 
     // 載入輸入訊號 (Q16.16 格式)
-    num_samples = load_csv_q16_16(INPUT_CSV_FILE, mixed_signal, N_MAX);
+    num_samples = load_csv_q16_16(INPUT_CSV_FILE, mixed_signal, TB_MAX_SAMPLES);
     if (num_samples == 0) {
         std::cerr << "錯誤: 無法載入輸入資料" << std::endl;
         return 1;
     }
 
     // 嘗試載入 golden reference (MATLAB 處理結果, Q16.16 格式)
-    int golden_len = load_csv_q16_16(GOLDEN_CSV_FILE, golden_signal, N_MAX);
+    int golden_len = load_csv_q16_16(GOLDEN_CSV_FILE, golden_signal, TB_MAX_SAMPLES);
     if (golden_len == num_samples) {
         has_golden = true;
         std::cout << "已載入 MATLAB 參考輸出 (AR_reference) 用於比對" << std::endl;
     }
 
     // 嘗試載入 ground truth (標準答案: 無偽影的 LFP 訊號, Q16.16 格式)
-    int gt_len = load_csv_q16_16(GROUND_TRUTH_CSV_FILE, ground_truth, N_MAX);
+    int gt_len = load_csv_q16_16(GROUND_TRUTH_CSV_FILE, ground_truth, TB_MAX_SAMPLES);
     if (gt_len == num_samples) {
         has_ground_truth = true;
         std::cout << "已載入標準答案 (post_lfp_data, 無偽影) 用於比對" << std::endl;
