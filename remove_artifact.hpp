@@ -322,6 +322,78 @@ inline data_t axis_to_data(axis_pkt_t pkt) {
     return val;
 }
 
+// ============================================================
+// Sin/Cos 查找表 + 線性插值
+// ============================================================
+
+/**
+ * @brief Sin/Cos LUT + 線性插值（方案 B）
+ *
+ * 資源節省版本：使用查找表替代 hls::sinf/cosf
+ * - LUT 大小：1024 項（解析度 2π/1024 ≈ 0.006 rad）
+ * - 插值方法：線性插值
+ * - 預期精度：~14-bit（足夠訊號處理使用）
+ * - 預期節省：~17,668 LUT，~1,324 DSP
+ *
+ * @param phase 輸入相位（弧度，任意範圍）
+ * @param sin_val 輸出 sin 值
+ * @param cos_val 輸出 cos 值
+ */
+
+// LUT 大小（1024 項 = 2^10，便於位元運算）
+const int SINCOS_LUT_SIZE = 1024;
+const float LUT_SCALE = SINCOS_LUT_SIZE / TWO_PI;  // index = phase * LUT_SCALE
+
+// Sin LUT（預計算值，0 到 2π）
+const trig_t sin_lut[SINCOS_LUT_SIZE] = {
+    #include "sin_lut_1024.h"
+};
+
+// Cos LUT（預計算值，0 到 2π）
+const trig_t cos_lut[SINCOS_LUT_SIZE] = {
+    #include "cos_lut_1024.h"
+};
+
+/**
+ * @brief Sin/Cos LUT + 線性插值函數
+ */
+inline void sincos_lut_interp(float phase, trig_t& sin_val, trig_t& cos_val) {
+    #pragma HLS INLINE
+    #pragma HLS ARRAY_PARTITION variable=sin_lut cyclic factor=8 dim=1
+    #pragma HLS ARRAY_PARTITION variable=cos_lut cyclic factor=8 dim=1
+
+    // 步驟 1: 歸一化相位到 [0, 2π)
+    // 使用 fmodf 確保相位在正確範圍內
+    float phase_norm = phase;
+    if (phase_norm < 0) {
+        phase_norm += TWO_PI * hls::ceilf(-phase_norm / TWO_PI);
+    }
+    if (phase_norm >= TWO_PI) {
+        phase_norm -= TWO_PI * hls::floorf(phase_norm / TWO_PI);
+    }
+
+    // 步驟 2: 計算 LUT 索引和小數部分
+    float idx_float = phase_norm * LUT_SCALE;
+    int idx = int(idx_float);
+    float frac = idx_float - float(idx);
+
+    // 步驟 3: 處理索引邊界（防止 idx=1024）
+    if (idx >= SINCOS_LUT_SIZE) {
+        idx = 0;
+    }
+    int idx_next = (idx + 1) & (SINCOS_LUT_SIZE - 1);  // 模運算（2^10 優化）
+
+    // 步驟 4: 線性插值
+    // result = lut[idx] + frac * (lut[idx+1] - lut[idx])
+    trig_t sin_0 = sin_lut[idx];
+    trig_t sin_1 = sin_lut[idx_next];
+    trig_t cos_0 = cos_lut[idx];
+    trig_t cos_1 = cos_lut[idx_next];
+
+    sin_val = sin_0 + trig_t(frac) * (sin_1 - sin_0);
+    cos_val = cos_0 + trig_t(frac) * (cos_1 - cos_0);
+}
+
 /**
  * @brief 定點 CORDIC sin/cos 計算（優化版）
  *

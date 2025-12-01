@@ -501,9 +501,194 @@ ip.write(0x00, 0x07)  # ctrl_reg = 0b0111 (enable + mode + flush)
 
 ---
 
+## 資源優化歷程
+
+### 目標資源限制
+
+目標平台 KV260 在扣除濾波器模組 (112 DSP, 18,591 LUT) 後的可用資源:
+
+| 資源類型 | 總量 | 濾波器用量 | 可用量 | 目標使用率 |
+|---------|------|-----------|--------|-----------|
+| **BRAM** | 288 | 0 | 288 | < 100% |
+| **DSP** | 1,248 | 112 | **1,136** | < 100% |
+| **LUT** | 117,120 | 18,591 | **98,529** | < 100% |
+| **FF** | 234,240 | 0 | 234,240 | < 100% |
+
+### 優化方案對比
+
+#### 初始狀態 (K=6)
+
+```
+BRAM:     64 /    288 =  22% ✅
+DSP:   2,540 /  1,248 = 203% ❌ (超標 103%)
+LUT: 173,091 /117,120 = 147% ❌ (超標  47%)
+FF:   93,781 /234,240 =  40% ✅
+相關係數: 0.967 ✅
+```
+
+#### 方案 1: 減少諧波數 (K=6 → K=4)
+
+**改動**: 將諧波數從 6 降到 4，矩陣維度從 13×13 降到 9×9
+
+```
+BRAM:      64 /    288 =  22% ✅ (無變化)
+DSP:    1,356 /  1,248 = 108% ❌ (改善 95%)
+LUT:  118,936 /117,120 = 101% ❌ (改善 31%)
+FF:    65,691 /234,240 =  28% ✅
+相關係數: 0.963 ✅
+```
+
+**效果**: 顯著改善但仍超標，精度損失可接受 (0.967 → 0.963)
+
+#### 方案 C: 資源共享 (除法器限制)
+
+**改動**: 在 `cholesky_solve()` 中加入 `#pragma HLS ALLOCATION operation instances=sdiv limit=2`
+
+```
+BRAM:      64 /    288 =  22% ✅ (無變化)
+DSP:    1,356 /  1,248 = 108% ❌ (無變化)
+LUT:  112,357 /117,120 =  95% ❌ (改善 5.5%)
+FF:    57,040 /234,240 =  24% ✅ (改善 13%)
+相關係數: 0.963 ✅ (無變化)
+```
+
+**效果**: LUT 小幅改善，仍未達標
+
+#### 方案 B: Sin/Cos LUT + 線性插值 (當前版本)
+
+**改動**:
+1. 新增 1024 項 sin/cos 查找表
+2. 實現線性插值函數 `sincos_lut_interp()`
+3. 替換所有 `hls::sinf()` 和 `hls::cosf()` 調用（3 處）
+4. 新增檔案: `sin_lut_1024.h`, `cos_lut_1024.h`
+
+```
+BRAM:     192 /    288 =  66% ✅ (增加 128, +200%)
+DSP:    1,324 /  1,248 = 106% ❌ (改善  32, -2.4%)
+LUT:  105,881 /117,120 =  90% ✅ (改善 6,476, -5.8%)
+FF:    79,584 /234,240 =  33% ✅ (增加 22,544, +39.5%)
+時脈: 7.390 ns < 10.00 ns ✅
+相關係數: 0.963 ✅ (無變化)
+```
+
+**與預算比較**:
+- LUT: 105,881 / 98,529 = **107% (仍超標 7%)**
+- DSP: 1,324 / 1,136 = **116% (仍超標 16%)**
+
+**觀察**:
+- BRAM 大幅增加: LUT 陣列被合成器轉換為 8 個 BRAM ROM 副本以滿足 II=1
+- LUT 節省不如預期: 預期 ~17,668，實際僅 6,476 (38% 效果)
+- DSP 未顯著減少: sin/cos 不是 DSP 瓶頸，Gram 矩陣和 Cholesky 求解才是
+- 精度完全保持: 0.963 相關係數不變
+
+### 方案 B 實施細節
+
+#### 1. Sin/Cos LUT 定義 ([remove_artifact.hpp:343-355](remove_artifact.hpp#L343-L355))
+
+```cpp
+// LUT 大小（1024 項 = 2^10，便於位元運算）
+const int SINCOS_LUT_SIZE = 1024;
+const float LUT_SCALE = SINCOS_LUT_SIZE / TWO_PI;
+
+// Sin LUT（預計算值，0 到 2π）
+const trig_t sin_lut[SINCOS_LUT_SIZE] = {
+    #include "sin_lut_1024.h"  // 解析度: 2π/1024 ≈ 0.006 rad
+};
+
+// Cos LUT（預計算值，0 到 2π）
+const trig_t cos_lut[SINCOS_LUT_SIZE] = {
+    #include "cos_lut_1024.h"
+};
+```
+
+#### 2. 線性插值函數 ([remove_artifact.hpp:360-395](remove_artifact.hpp#L360-L395))
+
+```cpp
+inline void sincos_lut_interp(float phase, trig_t& sin_val, trig_t& cos_val) {
+    #pragma HLS INLINE
+    #pragma HLS ARRAY_PARTITION variable=sin_lut cyclic factor=8 dim=1
+    #pragma HLS ARRAY_PARTITION variable=cos_lut cyclic factor=8 dim=1
+
+    // 步驟 1: 歸一化相位到 [0, 2π)
+    float phase_norm = phase;
+    if (phase_norm < 0) {
+        phase_norm += TWO_PI * hls::ceilf(-phase_norm / TWO_PI);
+    }
+    if (phase_norm >= TWO_PI) {
+        phase_norm -= TWO_PI * hls::floorf(phase_norm / TWO_PI);
+    }
+
+    // 步驟 2: 計算 LUT 索引和小數部分
+    float idx_float = phase_norm * LUT_SCALE;
+    int idx = int(idx_float);
+    float frac = idx_float - float(idx);
+
+    // 步驟 3: 處理索引邊界（防止 idx=1024）
+    if (idx >= SINCOS_LUT_SIZE) {
+        idx = 0;
+    }
+    int idx_next = (idx + 1) & (SINCOS_LUT_SIZE - 1);
+
+    // 步驟 4: 線性插值
+    trig_t sin_0 = sin_lut[idx];
+    trig_t sin_1 = sin_lut[idx_next];
+    trig_t cos_0 = cos_lut[idx];
+    trig_t cos_1 = cos_lut[idx_next];
+
+    sin_val = sin_0 + trig_t(frac) * (sin_1 - sin_0);
+    cos_val = cos_0 + trig_t(frac) * (cos_1 - cos_0);
+}
+```
+
+#### 3. 替換位置
+
+替換了以下 3 處 `hls::sinf/cosf` 調用:
+
+1. **FLUSH 模式 sin/cos 生成** ([remove_artifact.cpp:304-312](remove_artifact.cpp#L304-L312))
+2. **正常視窗 sin/cos 生成** ([remove_artifact.cpp:437-445](remove_artifact.cpp#L437-L445))
+3. **內部視窗處理** ([remove_artifact.cpp:604-612](remove_artifact.cpp#L604-L612))
+
+### 當前狀態與未來方向
+
+**當前配置** (2024-12-01):
+- **K = 4** 諧波
+- **BRAM**: 66% (安全)
+- **DSP**: 106% (超標 6%)
+- **LUT**: 107% 相對目標 (超標 7%)，90% 相對總量 (安全)
+- **精度**: 0.963 相關係數 ✅
+
+**可能的進一步優化**:
+
+1. **方案 B+ (調整 LUT 配置)**
+   - 減少 `ARRAY_PARTITION` factor (8 → 2-4)
+   - 可能減少 BRAM 和改善 LUT
+   - 輕微增加延遲
+
+2. **方案 A+B (混合優化)**
+   - 保留 LUT sin/cos
+   - 加入固定點除法替代浮點除法
+   - 預期額外節省 ~16,000 LUT
+   - 可能增加 18 DSP
+
+3. **減少 WINDOW_SIZE**
+   - 從 3696 降到 2772 或 1848
+   - 主要節省 BRAM
+   - 可能輕微影響頻率解析度
+
+**結論**: 方案 B 成功減少 LUT 用量並保持精度，但 DSP 和 LUT 仍略超標。如需完全符合預算，建議嘗試方案 A+B 混合優化。
+
+---
+
 ## 近期更新
 
 ### 2024-12-01
+
+**Commit: `[待提交]` - feat: Sin/Cos LUT optimization (Plan B)**
+
+- 實現 1024 項 sin/cos 查找表 + 線性插值
+- LUT 用量從 112,357 降到 105,881 (-5.8%)
+- 精度完全保持 (0.963 相關係數)
+- 新增檔案: `sin_lut_1024.h`, `cos_lut_1024.h`
 
 **Commit: `6e2f5d5` - fix: real-time border smoothing**
 
@@ -534,6 +719,12 @@ ip.write(0x00, 0x07)  # ctrl_reg = 0b0111 (enable + mode + flush)
    - 新增 40 秒測試資料（1,200,000 samples）
    - 包含 Ground Truth 比對
    - 支援三方驗證（HLS vs MATLAB vs Ground Truth）
+
+4. **資源優化**
+   - K 從 10 降到 4 (矩陣維度 21×21 → 9×9)
+   - 除法器資源共享 (18 → 2 個實例)
+   - Sin/Cos LUT 替代浮點函數
+   - 累積 LUT 節省 ~18%，DSP 節省 ~47%
 
 ---
 

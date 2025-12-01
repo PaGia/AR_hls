@@ -129,13 +129,23 @@ void remove_artifact_batch(
         }
     }
 
-    // ===== 階段 3: 累加 Gram 矩陣 =====
+    // ===== 階段 3: 累加 Gram 矩陣 (優化版：減少乘法位寬) =====
     GRAM_ACCUMULATE:
     for (int n = 0; n < N; n++) {
         #pragma HLS PIPELINE II=1
         #pragma HLS LOOP_TRIPCOUNT min=1024 max=32768
 
         data_t s_n = S[n];
+        trig_t c_k_arr[K], s_k_arr[K];
+        #pragma HLS ARRAY_PARTITION variable=c_k_arr complete
+        #pragma HLS ARRAY_PARTITION variable=s_k_arr complete
+
+        // 預載入當前樣本的 sin/cos 值
+        for (int k = 0; k < K; k++) {
+            #pragma HLS UNROLL
+            c_k_arr[k] = cos_vals[k][n];
+            s_k_arr[k] = sin_vals[k][n];
+        }
 
         // DC 項 (M[0][0] = N)
         M[0][0] += 1;
@@ -146,28 +156,35 @@ void remove_artifact_batch(
         for (int k = 0; k < K; k++) {
             #pragma HLS UNROLL factor=2
 
-            trig_t c_k = cos_vals[k][n];
-            trig_t s_k = sin_vals[k][n];
+            trig_t c_k = c_k_arr[k];
+            trig_t s_k = s_k_arr[k];
 
             // 第一行 (cos/sin 的和)
             M[0][k + 1] += accum_t(c_k);
             M[0][K + 1 + k] += accum_t(s_k);
 
-            // b 向量
-            b[k + 1] += accum_t(s_n) * accum_t(c_k);
-            b[K + 1 + k] += accum_t(s_n) * accum_t(s_k);
+            // b 向量 (優化：48-bit 乘法)
+            ap_fixed<48, 20> temp_bc = ap_fixed<48, 20>(s_n) * ap_fixed<48, 20>(c_k);
+            ap_fixed<48, 20> temp_bs = ap_fixed<48, 20>(s_n) * ap_fixed<48, 20>(s_k);
+            b[k + 1] += accum_t(temp_bc);
+            b[K + 1 + k] += accum_t(temp_bs);
 
             // cos-cos, sin-sin, cos-sin 區塊
             GRAM_J_LOOP:
             for (int j = 0; j < K; j++) {
                 #pragma HLS UNROLL factor=2
 
-                trig_t c_j = cos_vals[j][n];
-                trig_t s_j = sin_vals[j][n];
+                trig_t c_j = c_k_arr[j];
+                trig_t s_j = s_k_arr[j];
 
-                M[k + 1][j + 1] += accum_t(c_k) * accum_t(c_j);
-                M[K + 1 + k][K + 1 + j] += accum_t(s_k) * accum_t(s_j);
-                M[k + 1][K + 1 + j] += accum_t(c_k) * accum_t(s_j);
+                // 優化：24-bit × 24-bit = 48-bit 乘法
+                ap_fixed<48, 4> temp_cc = ap_fixed<48, 4>(c_k) * ap_fixed<48, 4>(c_j);
+                ap_fixed<48, 4> temp_ss = ap_fixed<48, 4>(s_k) * ap_fixed<48, 4>(s_j);
+                ap_fixed<48, 4> temp_cs = ap_fixed<48, 4>(c_k) * ap_fixed<48, 4>(s_j);
+
+                M[k + 1][j + 1] += accum_t(temp_cc);
+                M[K + 1 + k][K + 1 + j] += accum_t(temp_ss);
+                M[k + 1][K + 1 + j] += accum_t(temp_cs);
             }
         }
     }
@@ -304,9 +321,11 @@ void remove_artifact_realtime(
                     for (int k = 0; k < K; k++) {
                         #pragma HLS UNROLL
                         float phase = (float)omega * (k + 1) * t;
-                        phase = phase - TWO_PI * hls::floorf(phase / TWO_PI);
-                        cos_vals[k][n] = trig_t(hls::cosf(phase));
-                        sin_vals[k][n] = trig_t(hls::sinf(phase));
+                        // 使用 LUT + 插值替代 hls::sinf/cosf（方案 B）
+                        trig_t sin_val, cos_val;
+                        sincos_lut_interp(phase, sin_val, cos_val);
+                        cos_vals[k][n] = cos_val;
+                        sin_vals[k][n] = sin_val;
                     }
                 }
 
@@ -327,30 +346,49 @@ void remove_artifact_realtime(
                     }
                 }
 
-                // 累加 Gram 矩陣
+                // 累加 Gram 矩陣 (優化版：減少乘法位寬)
                 FLUSH_GRAM:
                 for (int n = 0; n < N; n++) {
                     #pragma HLS PIPELINE II=1
                     data_t s_n = window_buf[n];
+                    trig_t c_k_arr[K], s_k_arr[K];
+                    #pragma HLS ARRAY_PARTITION variable=c_k_arr complete
+                    #pragma HLS ARRAY_PARTITION variable=s_k_arr complete
+
+                    for (int k = 0; k < K; k++) {
+                        #pragma HLS UNROLL
+                        c_k_arr[k] = cos_vals[k][n];
+                        s_k_arr[k] = sin_vals[k][n];
+                    }
 
                     M[0][0] += 1;
                     b[0] += accum_t(s_n);
 
                     for (int k = 0; k < K; k++) {
                         #pragma HLS UNROLL
-                        trig_t c_k = cos_vals[k][n];
-                        trig_t s_k = sin_vals[k][n];
+                        trig_t c_k = c_k_arr[k];
+                        trig_t s_k = s_k_arr[k];
 
                         M[0][k + 1] += accum_t(c_k);
                         M[0][K + 1 + k] += accum_t(s_k);
-                        b[k + 1] += accum_t(s_n) * accum_t(c_k);
-                        b[K + 1 + k] += accum_t(s_n) * accum_t(s_k);
+
+                        ap_fixed<48, 20> temp_bc = ap_fixed<48, 20>(s_n) * ap_fixed<48, 20>(c_k);
+                        ap_fixed<48, 20> temp_bs = ap_fixed<48, 20>(s_n) * ap_fixed<48, 20>(s_k);
+                        b[k + 1] += accum_t(temp_bc);
+                        b[K + 1 + k] += accum_t(temp_bs);
 
                         for (int j = 0; j < K; j++) {
                             #pragma HLS UNROLL
-                            M[k + 1][j + 1] += accum_t(c_k) * accum_t(cos_vals[j][n]);
-                            M[K + 1 + k][K + 1 + j] += accum_t(s_k) * accum_t(sin_vals[j][n]);
-                            M[k + 1][K + 1 + j] += accum_t(c_k) * accum_t(sin_vals[j][n]);
+                            trig_t c_j = c_k_arr[j];
+                            trig_t s_j = s_k_arr[j];
+
+                            ap_fixed<48, 4> temp_cc = ap_fixed<48, 4>(c_k) * ap_fixed<48, 4>(c_j);
+                            ap_fixed<48, 4> temp_ss = ap_fixed<48, 4>(s_k) * ap_fixed<48, 4>(s_j);
+                            ap_fixed<48, 4> temp_cs = ap_fixed<48, 4>(c_k) * ap_fixed<48, 4>(s_j);
+
+                            M[k + 1][j + 1] += accum_t(temp_cc);
+                            M[K + 1 + k][K + 1 + j] += accum_t(temp_ss);
+                            M[k + 1][K + 1 + j] += accum_t(temp_cs);
                         }
                     }
                 }
@@ -435,9 +473,11 @@ void remove_artifact_realtime(
             for (int k = 0; k < K; k++) {
                 #pragma HLS UNROLL
                 float phase = (float)omega * (k + 1) * t;
-                phase = phase - TWO_PI * hls::floorf(phase / TWO_PI);
-                cos_vals[k][n] = trig_t(hls::cosf(phase));
-                sin_vals[k][n] = trig_t(hls::sinf(phase));
+                // 使用 LUT + 插值替代 hls::sinf/cosf（方案 B）
+                trig_t sin_val, cos_val;
+                sincos_lut_interp(phase, sin_val, cos_val);
+                cos_vals[k][n] = cos_val;
+                sin_vals[k][n] = sin_val;
             }
         }
 
@@ -459,29 +499,53 @@ void remove_artifact_realtime(
         }
 
         // 累加 Gram 矩陣
+        // 優化：使用較低位寬進行乘法，減少 DSP 消耗
+        // trig_t (24-bit) × trig_t (24-bit) = 48-bit，再累加到 80-bit
         GRAM_ACCUMULATE:
         for (int n = 0; n < WINDOW_SIZE; n++) {
             #pragma HLS PIPELINE II=1
             data_t s_n = window_buf[n];
+            trig_t c_k_arr[K], s_k_arr[K];
+            #pragma HLS ARRAY_PARTITION variable=c_k_arr complete
+            #pragma HLS ARRAY_PARTITION variable=s_k_arr complete
+
+            // 預載入當前樣本的 sin/cos 值
+            for (int k = 0; k < K; k++) {
+                #pragma HLS UNROLL
+                c_k_arr[k] = cos_vals[k][n];
+                s_k_arr[k] = sin_vals[k][n];
+            }
 
             M[0][0] += 1;
             b[0] += accum_t(s_n);
 
             for (int k = 0; k < K; k++) {
                 #pragma HLS UNROLL
-                data_t c_k = cos_vals[k][n];
-                data_t s_k = sin_vals[k][n];
+                trig_t c_k = c_k_arr[k];
+                trig_t s_k = s_k_arr[k];
 
                 M[0][k + 1] += accum_t(c_k);
                 M[0][K + 1 + k] += accum_t(s_k);
-                b[k + 1] += accum_t(s_n) * accum_t(c_k);
-                b[K + 1 + k] += accum_t(s_n) * accum_t(s_k);
+
+                // 優化：先用 48-bit 做乘法，再累加
+                ap_fixed<48, 20> temp_bc = ap_fixed<48, 20>(s_n) * ap_fixed<48, 20>(c_k);
+                ap_fixed<48, 20> temp_bs = ap_fixed<48, 20>(s_n) * ap_fixed<48, 20>(s_k);
+                b[k + 1] += accum_t(temp_bc);
+                b[K + 1 + k] += accum_t(temp_bs);
 
                 for (int j = 0; j < K; j++) {
                     #pragma HLS UNROLL
-                    M[k + 1][j + 1] += accum_t(c_k) * accum_t(cos_vals[j][n]);
-                    M[K + 1 + k][K + 1 + j] += accum_t(s_k) * accum_t(sin_vals[j][n]);
-                    M[k + 1][K + 1 + j] += accum_t(c_k) * accum_t(sin_vals[j][n]);
+                    trig_t c_j = c_k_arr[j];
+                    trig_t s_j = s_k_arr[j];
+
+                    // 優化：24-bit × 24-bit = 48-bit 乘法
+                    ap_fixed<48, 4> temp_cc = ap_fixed<48, 4>(c_k) * ap_fixed<48, 4>(c_j);
+                    ap_fixed<48, 4> temp_ss = ap_fixed<48, 4>(s_k) * ap_fixed<48, 4>(s_j);
+                    ap_fixed<48, 4> temp_cs = ap_fixed<48, 4>(c_k) * ap_fixed<48, 4>(s_j);
+
+                    M[k + 1][j + 1] += accum_t(temp_cc);
+                    M[K + 1 + k][K + 1 + j] += accum_t(temp_ss);
+                    M[k + 1][K + 1 + j] += accum_t(temp_cs);
                 }
             }
         }
@@ -600,10 +664,11 @@ void process_window_internal(
         for (int k = 0; k < K; k++) {
             #pragma HLS UNROLL
             float phase = (float)omega * (k + 1) * t;
-            // 相位歸一化到 [-π, π]
-            phase = phase - TWO_PI * hls::floorf(phase / TWO_PI);
-            cos_vals[k][n] = trig_t(hls::cosf(phase));
-            sin_vals[k][n] = trig_t(hls::sinf(phase));
+            // 使用 LUT + 插值替代 hls::sinf/cosf（方案 B）
+            trig_t sin_val, cos_val;
+            sincos_lut_interp(phase, sin_val, cos_val);
+            cos_vals[k][n] = cos_val;
+            sin_vals[k][n] = sin_val;
         }
     }
 
@@ -617,31 +682,51 @@ void process_window_internal(
         }
     }
 
-    // 累加 Gram 矩陣
+    // 累加 Gram 矩陣 (優化版：減少乘法位寬)
     GRAM_WIN:
     for (int n = 0; n < WINDOW_SIZE; n++) {
         #pragma HLS PIPELINE II=1
 
         data_t s_n = window[n];
+        trig_t c_k_arr[K], s_k_arr[K];
+        #pragma HLS ARRAY_PARTITION variable=c_k_arr complete
+        #pragma HLS ARRAY_PARTITION variable=s_k_arr complete
+
+        for (int k = 0; k < K; k++) {
+            #pragma HLS UNROLL
+            c_k_arr[k] = cos_vals[k][n];
+            s_k_arr[k] = sin_vals[k][n];
+        }
+
         M[0][0] += 1;
         b[0] += accum_t(s_n);
 
         for (int k = 0; k < K; k++) {
             #pragma HLS UNROLL
 
-            trig_t c_k = cos_vals[k][n];
-            trig_t s_k = sin_vals[k][n];
+            trig_t c_k = c_k_arr[k];
+            trig_t s_k = s_k_arr[k];
 
             M[0][k + 1] += accum_t(c_k);
             M[0][K + 1 + k] += accum_t(s_k);
-            b[k + 1] += accum_t(s_n) * accum_t(c_k);
-            b[K + 1 + k] += accum_t(s_n) * accum_t(s_k);
+
+            ap_fixed<48, 20> temp_bc = ap_fixed<48, 20>(s_n) * ap_fixed<48, 20>(c_k);
+            ap_fixed<48, 20> temp_bs = ap_fixed<48, 20>(s_n) * ap_fixed<48, 20>(s_k);
+            b[k + 1] += accum_t(temp_bc);
+            b[K + 1 + k] += accum_t(temp_bs);
 
             for (int j = 0; j < K; j++) {
                 #pragma HLS UNROLL
-                M[k + 1][j + 1] += accum_t(c_k) * accum_t(cos_vals[j][n]);
-                M[K + 1 + k][K + 1 + j] += accum_t(s_k) * accum_t(sin_vals[j][n]);
-                M[k + 1][K + 1 + j] += accum_t(c_k) * accum_t(sin_vals[j][n]);
+                trig_t c_j = c_k_arr[j];
+                trig_t s_j = s_k_arr[j];
+
+                ap_fixed<48, 4> temp_cc = ap_fixed<48, 4>(c_k) * ap_fixed<48, 4>(c_j);
+                ap_fixed<48, 4> temp_ss = ap_fixed<48, 4>(s_k) * ap_fixed<48, 4>(s_j);
+                ap_fixed<48, 4> temp_cs = ap_fixed<48, 4>(c_k) * ap_fixed<48, 4>(s_j);
+
+                M[k + 1][j + 1] += accum_t(temp_cc);
+                M[K + 1 + k][K + 1 + j] += accum_t(temp_ss);
+                M[k + 1][K + 1 + j] += accum_t(temp_cs);
             }
         }
     }
