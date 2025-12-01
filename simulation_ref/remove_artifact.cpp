@@ -34,20 +34,71 @@ void remove_artifact_top(
     hls::stream<axis_pkt_t>& s_axis,
     hls::stream<axis_pkt_t>& m_axis,
     float dbs_freq,
-    ap_uint<1> enable,
-    ap_uint<1> flush
+    ap_uint<32> num_samples,
+    ap_uint<32> ctrl_reg,
+    ap_uint<32>& status_reg
 ) {
     // ===== 介面宣告 =====
-    // 只保留 real-time 模式所需的接口
     #pragma HLS INTERFACE axis port=s_axis
     #pragma HLS INTERFACE axis port=m_axis
-    #pragma HLS INTERFACE s_axilite port=dbs_freq  bundle=ctrl
-    #pragma HLS INTERFACE s_axilite port=enable    bundle=ctrl
-    #pragma HLS INTERFACE s_axilite port=flush     bundle=ctrl
-    #pragma HLS INTERFACE s_axilite port=return    bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=dbs_freq     bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=num_samples  bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=ctrl_reg     bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=status_reg   bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=return       bundle=ctrl
 
-    // 直接調用 real-time 處理函數
-    remove_artifact_realtime(s_axis, m_axis, dbs_freq, enable, flush);
+    // 解析控制暫存器
+    bool enable      = (ctrl_reg & CTRL_ENABLE_MASK) != 0;
+    bool mode_stream = (ctrl_reg & CTRL_MODE_MASK) != 0;
+    bool flush       = (ctrl_reg & CTRL_FLUSH_MASK) != 0;
+    bool start       = (ctrl_reg & CTRL_START_MASK) != 0;
+    bool reset_state = (ctrl_reg & CTRL_RESET_MASK) != 0;
+
+    // 靜態狀態變數
+    static bool is_busy = false;
+    static bool is_done = false;
+
+    // 重置狀態
+    if (reset_state) {
+        is_busy = false;
+        is_done = false;
+        status_reg = STATUS_READY_MASK;
+        return;
+    }
+
+    // 更新狀態暫存器
+    status_reg = STATUS_READY_MASK;
+    if (is_busy) status_reg |= STATUS_BUSY_MASK;
+    if (is_done) status_reg |= STATUS_DONE_MASK;
+
+    // Bypass 模式
+    if (!enable) {
+        if (!s_axis.empty()) {
+            axis_pkt_t pkt = s_axis.read();
+            m_axis.write(pkt);
+        }
+        return;
+    }
+
+    // 根據模式選擇處理方式
+    if (mode_stream) {
+        // ===== 串流處理模式 =====
+        remove_artifact_realtime(s_axis, m_axis, dbs_freq, 1, flush ? 1 : 0);
+    } else {
+        // ===== 批次處理模式 =====
+        if (start && !is_busy) {
+            is_busy = true;
+            is_done = false;
+            status_reg = STATUS_READY_MASK | STATUS_BUSY_MASK;
+
+            // 執行批次處理
+            remove_artifact_batch(s_axis, m_axis, dbs_freq, (int)num_samples);
+
+            is_busy = false;
+            is_done = true;
+            status_reg = STATUS_READY_MASK | STATUS_DONE_MASK;
+        }
+    }
 }
 
 // ============================================================
@@ -69,8 +120,8 @@ void remove_artifact_batch(
 
     // ===== 內部緩衝 =====
     static data_t S[N_MAX];
-    static trig_t cos_vals[K][N_MAX];
-    static trig_t sin_vals[K][N_MAX];
+    static data_t cos_vals[K][N_MAX];
+    static data_t sin_vals[K][N_MAX];
 
     #pragma HLS BIND_STORAGE variable=S type=ram_2p
     #pragma HLS BIND_STORAGE variable=cos_vals type=ram_2p
@@ -85,8 +136,8 @@ void remove_artifact_batch(
     #pragma HLS ARRAY_PARTITION variable=alpha complete
 
     // 參數計算
-    const omega_t omega = omega_t(TWO_PI * dbs_freq);
-    const timestamp_t dt = timestamp_t(1.0f / FS);
+    const float omega = TWO_PI * dbs_freq;
+    const float dt = 1.0f / FS;
 
     // 限制樣本數
     int N = (num_samples > N_MAX) ? N_MAX : num_samples;
@@ -102,19 +153,17 @@ void remove_artifact_batch(
         S[n] = axis_to_data(pkt);
 
         // 計算時間
-        timestamp_t t = timestamp_t(n) * dt;
+        float t = n * dt;
 
         // 產生各諧波的 sin/cos
         SINCOS_HARMONICS:
         for (int k = 0; k < K; k++) {
             #pragma HLS UNROLL factor=2
 
-            ap_fixed<40, 8> phase = omega * (k + 1) * t;
-            // 使用 CORDIC
-            trig_t sin_val, cos_val;
-            cordic_sincos(phase, sin_val, cos_val);
-            cos_vals[k][n] = cos_val;
-            sin_vals[k][n] = sin_val;
+            float phase = omega * (k + 1) * t;
+            // 使用 HLS 數學函式庫
+            cos_vals[k][n] = data_t(hls::cosf(phase));
+            sin_vals[k][n] = data_t(hls::sinf(phase));
         }
     }
 
@@ -146,8 +195,8 @@ void remove_artifact_batch(
         for (int k = 0; k < K; k++) {
             #pragma HLS UNROLL factor=2
 
-            trig_t c_k = cos_vals[k][n];
-            trig_t s_k = sin_vals[k][n];
+            data_t c_k = cos_vals[k][n];
+            data_t s_k = sin_vals[k][n];
 
             // 第一行 (cos/sin 的和)
             M[0][k + 1] += accum_t(c_k);
@@ -162,8 +211,8 @@ void remove_artifact_batch(
             for (int j = 0; j < K; j++) {
                 #pragma HLS UNROLL factor=2
 
-                trig_t c_j = cos_vals[j][n];
-                trig_t s_j = sin_vals[j][n];
+                data_t c_j = cos_vals[j][n];
+                data_t s_j = sin_vals[j][n];
 
                 M[k + 1][j + 1] += accum_t(c_k) * accum_t(c_j);
                 M[K + 1 + k][K + 1 + j] += accum_t(s_k) * accum_t(s_j);
@@ -247,8 +296,8 @@ void remove_artifact_realtime(
     // 雙緩衝：前半段保留上一個視窗的後半部分
     static data_t window_buf[WINDOW_SIZE];
     static data_t output_buf[WINDOW_SIZE];  // 暫存處理結果
-    static trig_t cos_vals[K][WINDOW_SIZE];
-    static trig_t sin_vals[K][WINDOW_SIZE];
+    static data_t cos_vals[K][WINDOW_SIZE];
+    static data_t sin_vals[K][WINDOW_SIZE];
 
     #pragma HLS BIND_STORAGE variable=window_buf type=ram_2p
     #pragma HLS BIND_STORAGE variable=output_buf type=ram_2p
@@ -268,11 +317,11 @@ void remove_artifact_realtime(
     static bool has_prev_alpha = false;  // 是否有上一個 alpha
 
     // EMA 平滑係數 (0.3 = 30% 新值 + 70% 舊值)
-    const coef_t ALPHA_SMOOTH = coef_t(0.3);
+    const float ALPHA_SMOOTH = 0.3f;
 
     // 處理參數
-    const omega_t omega = omega_t(TWO_PI * dbs_freq);
-    const timestamp_t dt = timestamp_t(1.0 / FS);
+    const float omega = TWO_PI * dbs_freq;
+    const float dt = 1.0f / FS;
 
     // 輸出區域定義
     const int CENTER_START = HOP_SIZE / 2;  // 中央區域起始 = 462
@@ -300,13 +349,13 @@ void remove_artifact_realtime(
                 FLUSH_SINCOS:
                 for (int n = 0; n < N; n++) {
                     #pragma HLS PIPELINE II=1
-                    float t = (float)(global_idx - buf_idx + n) * (float)dt;
+                    float t = (float)(global_idx - buf_idx + n) * dt;
                     for (int k = 0; k < K; k++) {
                         #pragma HLS UNROLL
-                        float phase = (float)omega * (k + 1) * t;
+                        float phase = omega * (k + 1) * t;
                         phase = phase - TWO_PI * hls::floorf(phase / TWO_PI);
-                        cos_vals[k][n] = trig_t(hls::cosf(phase));
-                        sin_vals[k][n] = trig_t(hls::sinf(phase));
+                        cos_vals[k][n] = data_t(hls::cosf(phase));
+                        sin_vals[k][n] = data_t(hls::sinf(phase));
                     }
                 }
 
@@ -338,8 +387,8 @@ void remove_artifact_realtime(
 
                     for (int k = 0; k < K; k++) {
                         #pragma HLS UNROLL
-                        trig_t c_k = cos_vals[k][n];
-                        trig_t s_k = sin_vals[k][n];
+                        data_t c_k = cos_vals[k][n];
+                        data_t s_k = sin_vals[k][n];
 
                         M[0][k + 1] += accum_t(c_k);
                         M[0][K + 1 + k] += accum_t(s_k);
@@ -431,13 +480,13 @@ void remove_artifact_realtime(
         GEN_SINCOS:
         for (int n = 0; n < WINDOW_SIZE; n++) {
             #pragma HLS PIPELINE II=1
-            float t = (float)(global_idx - WINDOW_SIZE + n) * (float)dt;
+            float t = (float)(global_idx - WINDOW_SIZE + n) * dt;
             for (int k = 0; k < K; k++) {
                 #pragma HLS UNROLL
-                float phase = (float)omega * (k + 1) * t;
+                float phase = omega * (k + 1) * t;
                 phase = phase - TWO_PI * hls::floorf(phase / TWO_PI);
-                cos_vals[k][n] = trig_t(hls::cosf(phase));
-                sin_vals[k][n] = trig_t(hls::sinf(phase));
+                cos_vals[k][n] = data_t(hls::cosf(phase));
+                sin_vals[k][n] = data_t(hls::sinf(phase));
             }
         }
 
@@ -503,9 +552,8 @@ void remove_artifact_realtime(
             SMOOTH_ALPHA:
             for (int i = 0; i < M_SIZE; i++) {
                 #pragma HLS UNROLL
-                float alpha_smooth = (float)ALPHA_SMOOTH;
-                alpha[i] = coef_t(alpha_smooth * (float)alpha[i] +
-                                  (1.0f - alpha_smooth) * (float)prev_alpha[i]);
+                alpha[i] = coef_t(ALPHA_SMOOTH * (float)alpha[i] +
+                                  (1.0f - ALPHA_SMOOTH) * (float)prev_alpha[i]);
             }
         }
 
@@ -587,23 +635,23 @@ void process_window_internal(
     #pragma HLS ARRAY_PARTITION variable=M dim=1 complete
     #pragma HLS ARRAY_PARTITION variable=alpha complete
 
-    const omega_t omega = omega_t(TWO_PI * dbs_freq);
-    const timestamp_t dt = timestamp_t(1.0f / FS);
+    const float omega = TWO_PI * dbs_freq;
+    const float dt = 1.0f / FS;
 
     // 產生 sin/cos
     GEN_SINCOS:
     for (int n = 0; n < WINDOW_SIZE; n++) {
         #pragma HLS PIPELINE II=1
 
-        float t = (float)(start_idx + n) * (float)dt;
+        float t = (float)(start_idx + n) * dt;
 
         for (int k = 0; k < K; k++) {
             #pragma HLS UNROLL
-            float phase = (float)omega * (k + 1) * t;
-            // 相位歸一化到 [-π, π]
+            float phase = omega * (k + 1) * t;
+            // 相位歸一化到 [0, 2π)
             phase = phase - TWO_PI * hls::floorf(phase / TWO_PI);
-            cos_vals[k][n] = trig_t(hls::cosf(phase));
-            sin_vals[k][n] = trig_t(hls::sinf(phase));
+            cos_vals[k][n] = data_t(hls::cosf(phase));
+            sin_vals[k][n] = data_t(hls::sinf(phase));
         }
     }
 
@@ -629,8 +677,8 @@ void process_window_internal(
         for (int k = 0; k < K; k++) {
             #pragma HLS UNROLL
 
-            trig_t c_k = cos_vals[k][n];
-            trig_t s_k = sin_vals[k][n];
+            data_t c_k = cos_vals[k][n];
+            data_t s_k = sin_vals[k][n];
 
             M[0][k + 1] += accum_t(c_k);
             M[0][K + 1 + k] += accum_t(s_k);
@@ -683,10 +731,6 @@ void cholesky_solve(
 ) {
     #pragma HLS INLINE off
 
-    // 資源共享：限制除法器數量為 2 個（平衡資源和性能）
-    // 從原本的 18 個除法器減少到 2 個，可節省約 ~13,000 LUT
-    #pragma HLS ALLOCATION operation instances=sdiv limit=2
-
     // L 矩陣 (下三角)
     accum_t L[M_SIZE][M_SIZE];
     accum_t y[M_SIZE];
@@ -719,7 +763,7 @@ void cholesky_solve(
         if (sum <= 0) {
             sum = accum_t(1e-10);
         }
-        L[i][i] = accum_t(hls::sqrtf((float)sum));
+        L[i][i] = hls::sqrtf((float)sum);
 
         // 非對角元素
         CHOL_J:

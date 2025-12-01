@@ -43,9 +43,9 @@ const int TB_MAX_SAMPLES = 1200001;  // 支援 40 秒資料 (1200000 samples)
 #define USE_UNIFIED_INTERFACE true
 
 // 外部資料檔案路徑 (當 USE_EXTERNAL_DATA = true 時使用)
-const char* INPUT_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_add_lab_40s.csv";
-const char* GOLDEN_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/AR_reference_40s.csv";  // MATLAB 參考輸出
-const char* GROUND_TRUTH_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_lfp_data_40s.csv";  // 標準答案 (無偽影)
+const char* INPUT_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_add_lab_2s.csv";
+const char* GOLDEN_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/AR_reference_2s.csv";  // MATLAB 參考輸出
+const char* GROUND_TRUTH_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_lfp_data_2s.csv";  // 標準答案 (無偽影)
 
 // ============================================================
 // 控制暫存器位元定義 (與 remove_artifact.cpp 同步)
@@ -73,8 +73,7 @@ const float Q16_16_SCALE = 65536.0f;  // 2^16
 
 // 諧波振幅 (模擬真實 DBS 偽影)
 const float TRUE_AMPLITUDES[K] = {
-    500.0f, 300.0f, 200.0f, 150.0f, 100.0f,
-    80.0f, 60.0f, 40.0f, 30.0f, 20.0f
+    500.0f, 300.0f, 200.0f, 150.0f
 };
 
 // ============================================================
@@ -426,8 +425,9 @@ int main() {
         input_idx += samples_to_write;
 
         // 呼叫統一介面 (flush=0)
-        ctrl_reg = (1 << CTRL_ENABLE_BIT) | (1 << CTRL_MODE_BIT);
-        remove_artifact_top(s_axis, m_axis, reg_dbs_freq, reg_num_samples, ctrl_reg, status_reg);
+        ap_uint<1> enable = 1;
+        ap_uint<1> flush = 0;
+        remove_artifact_top(s_axis, m_axis, reg_dbs_freq, enable, flush);
 
         // 讀取輸出 (如果有的話)
         while (!m_axis.empty() && output_idx < num_samples) {
@@ -442,8 +442,9 @@ int main() {
 
     // ===== Flush: 輸出剩餘緩衝資料 =====
     std::cout << "執行 Flush..." << std::endl;
-    ctrl_reg = (1 << CTRL_ENABLE_BIT) | (1 << CTRL_MODE_BIT) | (1 << CTRL_FLUSH_BIT);
-    remove_artifact_top(s_axis, m_axis, reg_dbs_freq, reg_num_samples, ctrl_reg, status_reg);
+    ap_uint<1> enable_flush = 1;
+    ap_uint<1> do_flush = 1;
+    remove_artifact_top(s_axis, m_axis, reg_dbs_freq, enable_flush, do_flush);
 
     // 讀取 flush 輸出的資料
     while (!m_axis.empty() && output_idx < num_samples) {
@@ -475,11 +476,12 @@ int main() {
         s_axis.write(pkt);
     }
 
-    // 設定控制暫存器: enable=1, mode=0 (批次), start=1
-    ctrl_reg = (1 << CTRL_ENABLE_BIT) | (1 << CTRL_START_BIT);
+    // 設定控制: enable=1, flush=0 (批次模式已移除，使用 real-time)
+    ap_uint<1> enable_batch = 1;
+    ap_uint<1> flush_batch = 0;
 
     // 呼叫統一介面
-    remove_artifact_top(s_axis, m_axis, reg_dbs_freq, reg_num_samples, ctrl_reg, status_reg);
+    remove_artifact_top(s_axis, m_axis, reg_dbs_freq, enable_batch, flush_batch);
 
     // 讀取輸出
     for (int i = 0; i < num_samples; i++) {

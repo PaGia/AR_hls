@@ -31,8 +31,8 @@ const int FS = 30000;              // 採樣率 (Hz)
 const float DBS_FREQ_DEFAULT = 129.871f;  // 預設 DBS 頻率 (Hz)
 
 // 演算法參數
-const int K = 4;                  // 諧波數量
-const int M_SIZE = 2 * K + 1;      // 矩陣維度 (9)
+const int K = 10;                  // 諧波數量
+const int M_SIZE = 2 * K + 1;      // 矩陣維度 (21)
 
 // 視窗參數 (用於即時處理)
 // 視窗大小 = DBS 週期數 × 每週期樣本數
@@ -62,24 +62,15 @@ const float TWO_PI = 6.28318530717959f;
 // 訊號資料型態 (32位元, 16位元整數部分) - Q16.16 格式
 typedef ap_fixed<32, 16> data_t;
 
-// 累加器型態 (80位元, 避免溢位和精度損失)
+// 累加器型態 (64位元, 避免溢位)
 // 需要足夠位寬容納 N 次累加 (N_MAX = 32768 ≈ 2^15)
-// 48-bit 小數部分足以容納 trig_t(22-bit) × trig_t(22-bit) = 44-bit 結果
-typedef ap_fixed<80, 32> accum_t;
+typedef ap_fixed<64, 32> accum_t;
 
 // 係數型態 (與 data_t 相同格式)
 typedef ap_fixed<32, 16> coef_t;
 
 // 相位型態 (需要高精度小數)
 typedef ap_fixed<32, 4> phase_t;
-
-// 三角函數專用型態 (範圍 [-2, 2]，提高精度到 24-bit)
-typedef ap_fixed<24, 2> trig_t;
-
-// 頻率和時間相關型態 (提高精度)
-typedef ap_fixed<40, 16> freq_t;     // DBS 頻率用 (24-bit 小數)
-typedef ap_fixed<40, 12> timestamp_t; // 時間戳用 (28-bit 小數)
-typedef ap_fixed<40, 12> omega_t;     // 角頻率用 (28-bit 小數)
 
 // AXI-Stream 封包型態 (32位元資料，完整對應 Q16.16)
 typedef ap_axis<32, 0, 0, 0> axis_pkt_t;
@@ -131,22 +122,31 @@ struct harmonic_coef_t {
 // ============================================================
 
 /**
- * @brief 偽影移除頂層函數 (Real-time 串流模式)
+ * @brief 統一偽影移除函數 (支援批次和串流模式)
  *
- * 簡化版本，只支援 real-time 連續串流處理
+ * 所有參數都可透過 AXI-Lite 暫存器設定
  *
  * @param s_axis       輸入 AXI-Stream (來自 DMA)
  * @param m_axis       輸出 AXI-Stream (到 DMA)
  * @param dbs_freq     DBS 刺激頻率 (Hz) - AXI-Lite 可設定
- * @param enable       啟用開關 (0=bypass, 1=處理) - AXI-Lite 可設定
- * @param flush        結束信號 (1=flush 剩餘緩衝資料) - AXI-Lite 可設定
+ * @param num_samples  批次處理的樣本數 - AXI-Lite 可設定
+ * @param ctrl_reg     控制暫存器 - AXI-Lite 可設定
+ *                     bit 0: enable (0=bypass, 1=處理)
+ *                     bit 1: mode (0=批次, 1=串流)
+ *                     bit 2: flush (串流模式 flush)
+ *                     bit 3: start (批次模式開始)
+ * @param status_reg   狀態暫存器 - AXI-Lite 可讀取
+ *                     bit 0: ready
+ *                     bit 1: busy
+ *                     bit 2: done
  */
 void remove_artifact_top(
     hls::stream<axis_pkt_t>& s_axis,
     hls::stream<axis_pkt_t>& m_axis,
     float dbs_freq,
-    ap_uint<1> enable,
-    ap_uint<1> flush
+    ap_uint<32> num_samples,
+    ap_uint<32> ctrl_reg,
+    ap_uint<32>& status_reg
 );
 
 // ============================================================
@@ -323,228 +323,7 @@ inline data_t axis_to_data(axis_pkt_t pkt) {
 }
 
 /**
- * @brief 定點 CORDIC sin/cos 計算（優化版）
- *
- * 使用 CORDIC 算法計算 sin 和 cos，比浮點版本節省大量 DSP
- * 精度：~16-bit (足夠訊號處理使用)
- *
- * @param phase 輸入相位 (弧度)
- * @param sin_val 輸出 sin 值
- * @param cos_val 輸出 cos 值
- */
-inline void cordic_sincos(ap_fixed<40, 8> phase, trig_t& sin_val, trig_t& cos_val) {
-    #pragma HLS INLINE off
-    #pragma HLS PIPELINE II=1
-
-    // CORDIC 迭代次數（24 次達到 24-bit 精度）
-    const int CORDIC_ITERATIONS = 24;
-
-    // CORDIC 角度查找表（更高精度）
-    const ap_fixed<28, 2> cordic_angles[24] = {
-        0.785398163397448,   // atan(2^0)
-        0.463647609000806,   // atan(2^-1)
-        0.244978663126864,   // atan(2^-2)
-        0.124354994546761,   // atan(2^-3)
-        0.062418809995957,   // atan(2^-4)
-        0.031239833430268,   // atan(2^-5)
-        0.015623728620477,   // atan(2^-6)
-        0.007812341060101,   // atan(2^-7)
-        0.003906230131967,   // atan(2^-8)
-        0.001953122516479,   // atan(2^-9)
-        0.000976562189559,   // atan(2^-10)
-        0.000488281211195,   // atan(2^-11)
-        0.000244140620149,   // atan(2^-12)
-        0.000122070311894,   // atan(2^-13)
-        0.000061035156174,   // atan(2^-14)
-        0.000030517578115,   // atan(2^-15)
-        0.000015258789061,   // atan(2^-16)
-        0.000007629394531,   // atan(2^-17)
-        0.000003814697266,   // atan(2^-18)
-        0.000001907348633,   // atan(2^-19)
-        0.000000953674316,   // atan(2^-20)
-        0.000000476837158,   // atan(2^-21)
-        0.000000238418579,   // atan(2^-22)
-        0.000000119209290    // atan(2^-23)
-    };
-
-    // 歸一化相位到 [-π, π]
-    ap_fixed<40, 8> angle = phase;
-    const ap_fixed<40, 8> PI = 3.14159265358979;
-    const ap_fixed<40, 8> TWO_PI_FIXED = 6.28318530717959;
-
-    // 使用定點運算做 mod 2π
-    if (angle > PI) {
-        angle -= TWO_PI_FIXED;
-    } else if (angle < -PI) {
-        angle += TWO_PI_FIXED;
-    }
-
-    // 象限判斷
-    int quadrant = 0;
-    if (angle > PI/2) {
-        angle = PI - angle;
-        quadrant = 1;
-    } else if (angle < -PI/2) {
-        angle = -PI - angle;
-        quadrant = 3;
-    }
-
-    // CORDIC 迭代
-    ap_fixed<28, 2> x = 0.607252935008881;  // 1/K (CORDIC gain, 更高精度)
-    ap_fixed<28, 2> y = 0;
-    ap_fixed<40, 8> z = angle;
-
-    #pragma HLS array_partition variable=cordic_angles complete
-
-    for (int i = 0; i < CORDIC_ITERATIONS; i++) {
-        #pragma HLS UNROLL
-        ap_fixed<28, 2> x_new, y_new;
-        ap_fixed<40, 8> z_new;
-
-        if (z >= 0) {
-            x_new = x - (y >> i);
-            y_new = y + (x >> i);
-            z_new = z - cordic_angles[i];
-        } else {
-            x_new = x + (y >> i);
-            y_new = y - (x >> i);
-            z_new = z + cordic_angles[i];
-        }
-
-        x = x_new;
-        y = y_new;
-        z = z_new;
-    }
-
-    // 根據象限調整符號
-    if (quadrant == 1 || quadrant == 3) {
-        cos_val = trig_t(-x);
-    } else {
-        cos_val = trig_t(x);
-    }
-
-    if (quadrant == 3) {
-        sin_val = trig_t(-y);
-    } else {
-        sin_val = trig_t(y);
-    }
-}
-
-/**
- * @brief 定點 sqrt 近似（Newton-Raphson 法）
- *
- * 使用 Newton-Raphson 迭代計算平方根
- * 精度：~16-bit
- *
- * @param x 輸入值（必須 >= 0）
- * @return 平方根
- */
-inline ap_fixed<32, 16> fixed_sqrt(ap_fixed<64, 32> x) {
-    #pragma HLS INLINE off
-    #pragma HLS PIPELINE II=1
-
-    if (x <= 0) {
-        return ap_fixed<32, 16>(0);
-    }
-
-    // 初始猜測（使用位移近似）
-    ap_fixed<32, 16> guess = ap_fixed<32, 16>(x) >> 1;
-
-    // Newton-Raphson 迭代：x_new = (x_old + n/x_old) / 2
-    // 12 次迭代達到更高精度
-    for (int i = 0; i < 12; i++) {
-        #pragma HLS UNROLL
-        guess = (guess + ap_fixed<32, 16>(x) / guess) >> 1;
-    }
-
-    return guess;
-}
-
-/**
- * @brief 高精度定點 sqrt（Newton-Raphson 法）
- *
- * 使用 Newton-Raphson 迭代計算平方根，保留高精度
- * 精度：~24-bit
- *
- * @param x 輸入值（必須 >= 0），80-bit, 48-bit 小數
- * @return 平方根，48-bit, 32-bit 小數
- */
-inline ap_fixed<48, 16> fixed_sqrt_hp(ap_fixed<80, 32> x) {
-    #pragma HLS INLINE off
-    #pragma HLS PIPELINE II=1
-
-    if (x <= 0) {
-        return ap_fixed<48, 16>(0);
-    }
-
-    // 初始猜測（使用位移近似）
-    ap_fixed<48, 16> guess = ap_fixed<48, 16>(x) >> 1;
-
-    // 避免初始猜測為 0
-    if (guess <= 0) {
-        guess = ap_fixed<48, 16>(1.0);
-    }
-
-    // Newton-Raphson 迭代：x_new = (x_old + n/x_old) / 2
-    // 16 次迭代達到 24-bit 精度
-    for (int i = 0; i < 16; i++) {
-        #pragma HLS UNROLL
-        ap_fixed<48, 16> x_fp = ap_fixed<48, 16>(x);
-        guess = (guess + x_fp / guess) >> 1;
-    }
-
-    return guess;
-}
-
-/**
- * @brief 定點 mod 2π 運算（取代浮點 floorf）
- *
- * 將相位歸一化到 [-π, π] 範圍
- * 使用定點數運算，避免浮點數轉換
- *
- * @param phase 輸入相位（弧度）
- * @return 歸一化後的相位 [-π, π]
- */
-inline ap_fixed<40, 8> phase_mod_2pi(ap_fixed<40, 8> phase) {
-    #pragma HLS INLINE
-
-    const ap_fixed<40, 8> TWO_PI_FP = 6.28318530717959;
-    const ap_fixed<40, 8> PI_FP = 3.14159265358979;
-    const ap_fixed<40, 8> NEG_PI_FP = -3.14159265358979;
-
-    // 使用迭代減法做 mod 2π (最多需要幾次迭代)
-    // 對於 DBS 頻率 ~130 Hz，最大相位約 ±1000，需要約 160 次迭代
-    // 但我們可以先用粗略估計減少迭代次數
-
-    ap_fixed<40, 8> result = phase;
-
-    // 粗略估計：快速減去 n×2π (使用位移近似除法)
-    // phase / 2π ≈ phase / 6.28 ≈ phase * 0.159
-    if (result > PI_FP) {
-        // 估計需要減去的 2π 倍數
-        ap_fixed<40, 8> n_approx = result * ap_fixed<40, 8>(0.159155);  // 1/(2π)
-        ap_fixed<40, 8> n_int = ap_fixed<40, 8>((int)n_approx);
-        result = result - n_int * TWO_PI_FP;
-
-        // 精細調整
-        while (result > PI_FP) {
-            result -= TWO_PI_FP;
-        }
-    } else if (result < NEG_PI_FP) {
-        ap_fixed<40, 8> n_approx = result * ap_fixed<40, 8>(0.159155);
-        ap_fixed<40, 8> n_int = ap_fixed<40, 8>((int)n_approx);
-        result = result - n_int * TWO_PI_FP;
-
-        while (result < NEG_PI_FP) {
-            result += TWO_PI_FP;
-        }
-    }
-
-    return result;
-}
-
-/**
- * @brief 快速 sin 近似 (Taylor 展開) - 舊版保留
+ * @brief 快速 sin 近似 (Taylor 展開)
  */
 inline data_t fast_sin(phase_t x) {
     #pragma HLS INLINE
@@ -557,7 +336,7 @@ inline data_t fast_sin(phase_t x) {
 }
 
 /**
- * @brief 快速 cos 近似 (Taylor 展開) - 舊版保留
+ * @brief 快速 cos 近似 (Taylor 展開)
  */
 inline data_t fast_cos(phase_t x) {
     #pragma HLS INLINE
