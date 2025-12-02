@@ -43,9 +43,9 @@ const int TB_MAX_SAMPLES = 1200001;  // 支援 40 秒資料 (1200000 samples)
 #define USE_UNIFIED_INTERFACE true
 
 // 外部資料檔案路徑 (當 USE_EXTERNAL_DATA = true 時使用)
-const char* INPUT_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_add_lab_2s.csv";
-const char* GOLDEN_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/AR_reference_2s.csv";  // MATLAB 參考輸出
-const char* GROUND_TRUTH_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_lfp_data_2s.csv";  // 標準答案 (無偽影)
+const char* INPUT_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_add_lab_40s.csv";
+const char* GOLDEN_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/AR_reference_40s.csv";  // MATLAB 參考輸出
+const char* GROUND_TRUTH_CSV_FILE = "/home/ntk/Xilinx_projects/HLS/KV260_HLS/RA/source_file/tset_file/post_lfp_data_40s.csv";  // 標準答案 (無偽影)
 
 // ============================================================
 // 控制暫存器位元定義 (與 remove_artifact.cpp 同步)
