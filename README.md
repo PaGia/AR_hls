@@ -32,7 +32,7 @@ A(t) = Σₖ₌₁ᴷ [αₖ·cos(2πfₖt) + βₖ·sin(2πfₖt)]
 其中：
 - `f` = DBS 刺激頻率 (通常 130 Hz)
 - `fₖ = k × f` = 第 k 次諧波頻率
-- `K` = 諧波數量 (預設 10)
+- `K` = 諧波數量 (預設 4)
 - `αₖ, βₖ` = 待估計的諧波係數
 
 ### 演算法流程
@@ -194,8 +194,8 @@ M = │ m₂₁ m₂₂  │ = │ l₂₁ l₂₂  │ × │ l₂₁ l₂₂  
 | 參數 | 值 | 說明 |
 |------|-----|------|
 | `FS` | 30000 | 採樣率 (Hz) |
-| `K` | 10 | 諧波數量 |
-| `M_SIZE` | 21 | 矩陣維度 (2K+1) |
+| `K` | 4 | 諧波數量 |
+| `M_SIZE` | 9 | 矩陣維度 (2K+1) |
 | `DBS_PERIODS` | 16 | 視窗包含的 DBS 週期數 |
 | `WINDOW_SIZE` | 3696 | 視窗大小 (16 個週期 × 231 samples) |
 | `HOP_SIZE` | 1848 | 跳躍大小 (50% 重疊) |
@@ -209,8 +209,9 @@ M = │ m₂₁ m₂₂  │ = │ l₂₁ l₂₂  │ × │ l₂₁ l₂₂  
 | 型態 | 定義 | 用途 |
 |------|------|------|
 | `data_t` | `ap_fixed<32, 16>` | 訊號資料 (Q16.16 格式) |
-| `accum_t` | `ap_fixed<64, 32>` | 累加器 (避免溢位) |
+| `accum_t` | `ap_fixed<80, 32>` | 累加器 (避免溢位) |
 | `coef_t` | `ap_fixed<32, 16>` | 諧波係數 |
+| `trig_t` | `ap_fixed<24, 2>` | 三角函數值 (sin/cos) |
 | `phase_t` | `ap_fixed<32, 4>` | 相位 (高精度小數) |
 | `axis_pkt_t` | `ap_axis<32, 0, 0, 0>` | AXI-Stream 封包 |
 
@@ -280,7 +281,7 @@ M = │ m₂₁ m₂₂  │ = │ l₂₁ l₂₂  │ × │ l₂₁ l₂₂  
 ### 1. 視窗長度 = DBS 週期整數倍
 
 ```
-視窗大小 = 8 × (fs / dbs_freq) = 8 × 231 ≈ 1848 samples
+視窗大小 = 16 × (fs / dbs_freq) = 16 × 231 = 3696 samples
 ```
 
 確保視窗內包含完整的 DBS 週期，避免頻譜洩漏。
@@ -313,11 +314,14 @@ float phase = 2π × freq × k × t;
 ```
 source_file/
 ├── remove_artifact.hpp              # 標頭檔 (型態、常數、函數宣告)
-├── remove_artifact.cpp              # HLS 可合成程式碼 (871 行)
-│   ├── remove_artifact_top()        # 統一介面 (支援批次/串流模式)
+├── remove_artifact.cpp              # HLS 可合成程式碼 (~913 行)
+│   ├── remove_artifact_top()        # 統一介面 (Real-time 串流模式)
 │   ├── remove_artifact_batch()      # 批次處理模式 (舊介面)
 │   ├── remove_artifact_realtime()   # 串流處理模式 (舊介面)
 │   └── 內部函數 (Gram 矩陣、Cholesky 求解等)
+│
+├── sin_lut_1024.h                   # Sin 查找表 (1024 項)
+├── cos_lut_1024.h                   # Cos 查找表 (1024 項)
 │
 ├── remove_artifact_tb.cpp           # C 測試平台 (775 行)
 │   ├── 支援外部 CSV 資料載入 (Q16.16 格式)
@@ -347,18 +351,17 @@ void remove_artifact_top(
     hls::stream<axis_pkt_t>& s_axis,     // 輸入 AXI-Stream
     hls::stream<axis_pkt_t>& m_axis,     // 輸出 AXI-Stream
     float dbs_freq,                      // DBS 頻率 (Hz)
-    ap_uint<32> num_samples,             // 批次樣本數
-    ap_uint<32> ctrl_reg,                // 控制暫存器
-    ap_uint<32>& status_reg              // 狀態暫存器
+    ap_uint<1> enable,                   // 啟用開關 (0=bypass, 1=處理)
+    ap_uint<1> flush                     // 結束信號 (1=flush 剩餘緩衝)
 );
 ```
 
 **特點：**
 
-- 單一函數支援批次和串流兩種模式
-- 透過 `ctrl_reg` 位元控制所有功能
+- 專用於 Real-time 串流模式
+- 透過 `enable` 控制 bypass/處理
+- 透過 `flush` 結束時清空剩餘緩衝資料
 - 所有參數可透過 AXI-Lite 動態設定
-- 支援狀態查詢和錯誤偵測
 
 ---
 
@@ -495,8 +498,9 @@ ip.write(0x00, 0x07)  # ctrl_reg = 0b0111 (enable + mode + flush)
 |------|----------|----------|
 | 處理速度 | ~1000× 即時 | 1× 即時 |
 | 延遲 | N cycles | ~62 ms (固定) |
-| BRAM 使用 | ~2 MB | ~50 KB |
-| DSP 使用 | ~60 | ~60 |
+| BRAM 使用 | 192 (66%) | 192 (66%) |
+| DSP 使用 | 1,088 (87%) | 1,088 (87%) |
+| LUT 使用 | 97,927 (83%) | 97,927 (83%) |
 | 時脈頻率 | 100 MHz | 100 MHz |
 
 ---
@@ -724,7 +728,7 @@ inline void sincos_lut_interp(float phase, trig_t& sin_val, trig_t& cos_val) {
 - 批次模式最大處理樣本數: 65536 (受 `N_MAX` 限制)
 - 串流模式固定延遲: ~62 ms (不可調整)
 - DBS 頻率範圍: 建議 100-200 Hz
-- 諧波數量固定為 10 (編譯時常數)
+- 諧波數量固定為 4 (編譯時常數)
 
 ---
 
@@ -733,7 +737,7 @@ inline void sincos_lut_interp(float phase, trig_t& sin_val, trig_t& cos_val) {
 - **原始 MATLAB 實現**: `remove_artifact_simplified.m`
 - **數學原理**: 最小二乘法諧波分解 (Least Squares Harmonic Decomposition)
 - **目標平台**: AMD KV260 Vision AI Starter Kit
-- **開發工具**: Vitis HLS 2023.2+
+- **開發工具**: Vitis HLS 2025.1
 
 ---
 
